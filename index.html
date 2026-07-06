@@ -68,7 +68,7 @@
 </div>
 
 <div id="streamPanel">
-  <label for="streamUrlInput">Play a link on the TV — .m3u/.m3u8 stream or a direct .mp4</label>
+  <label for="streamUrlInput">Play a link on the TV — .m3u/.m3u8 stream, an IPTV channel list, or a direct .mp4. Up/Down switches channels if a list loads.</label>
   <input id="streamUrlInput" type="text" placeholder="https://example.com/video.mp4" autocomplete="off">
   <button id="streamLoadBtn">Play</button>
   <div id="streamStatus"></div>
@@ -104,9 +104,13 @@ const crtCanvas = document.getElementById('crtCanvas');
 
 // No default video baked in anymore — the screen just shows static/no-signal
 // until a link is loaded via the panel (see loadStreamUrl). Once something
-// IS loaded, jump to a random point in it whenever it (re)loads, same as before.
+// IS loaded, jump to a random point in it whenever it (re)loads, same as
+// before — except for live streams (duration is Infinity/NaN there), which
+// just play from the live edge since there's nothing to seek into.
 vid.addEventListener('loadedmetadata', () => {
-  vid.currentTime = Math.random() * vid.duration;
+  if (Number.isFinite(vid.duration) && vid.duration > 0){
+    vid.currentTime = Math.random() * vid.duration;
+  }
   vid.play().catch(()=>{});
 });
 
@@ -114,20 +118,30 @@ vid.addEventListener('loadedmetadata', () => {
 // fake channel number, with a brief static burst and a random seek into
 // whatever's currently loaded (nothing to seek into until a link is loaded,
 // in which case it's just a no-signal flicker — that's expected).
+//
+// If the pasted link turns out to be an IPTV-style channel *list* (a .m3u/
+// .m3u8 file whose job is just to enumerate many other stream URLs, one per
+// channel — see parseChannelList() below) rather than a single video, that
+// list is kept in `channelList` and Up/Down (while sat at the TV) step
+// through it via changeChannelBy(). Clicking the screen never touches
+// `channelList`/`channelIndex` — it only re-seeks whatever is currently
+// loaded, same as before.
 let channelNum = 2 + (Math.random() * 82 | 0);
 let channelShownAt = performance.now();
 let staticUntil = 0;
+let channelList = null;   // array of {name, url}, or null if nothing multi-channel is loaded
+let channelIndex = 0;
 
 function flashStatic(durationMs){
   staticUntil = performance.now() + durationMs;
 }
 
 function surfChannel(){
-  channelNum = 2 + (Math.random() * 82 | 0);
+  if (!channelList) channelNum = 2 + (Math.random() * 82 | 0);
   channelShownAt = performance.now();
   flashStatic(350);
-  if (vid.readyState >= 2){
-    vid.currentTime = Math.random() * (vid.duration || 1);
+  if (vid.readyState >= 2 && Number.isFinite(vid.duration) && vid.duration > 0){
+    vid.currentTime = Math.random() * vid.duration;
     vid.play().catch(()=>{});
   }
 }
@@ -149,7 +163,9 @@ function drawChannelOSD(){
   if(age > holdMs + fadeMs) return;
   const alpha = age <= holdMs ? 1 : 1 - (age - holdMs) / fadeMs;
 
-  const txt = 'CH ' + String(channelNum).padStart(2, '0');
+  const txt = channelList
+    ? 'CH ' + String(channelIndex + 1).padStart(2, '0')
+    : 'CH ' + String(channelNum).padStart(2, '0');
   sctx.save();
   sctx.globalAlpha = alpha;
   sctx.font = 'bold 32px "VT323", "Courier New", monospace';
@@ -161,6 +177,19 @@ function drawChannelOSD(){
   sctx.fillText(txt, x+2, y+2);
   sctx.fillStyle = '#33ff33';
   sctx.fillText(txt, x, y);
+
+  // Channel name, smaller, under the number — only when tuned into a real
+  // multi-channel list (a fake surf number has no name to show).
+  if (channelList && channelList[channelIndex]){
+    const name = channelList[channelIndex].name;
+    sctx.font = '16px "VT323", "Courier New", monospace';
+    const nx = 256 - 10 - sctx.measureText(name).width;
+    const ny = y + 30;
+    sctx.fillStyle = '#000';
+    sctx.fillText(name, nx+1, ny+1);
+    sctx.fillStyle = '#33ff33';
+    sctx.fillText(name, nx, ny);
+  }
   sctx.restore();
 }
 
@@ -910,13 +939,106 @@ const streamStatus = document.getElementById('streamStatus');
 
 // ---- Loading a user-supplied link onto the TV ----
 // Direct video files (.mp4, .webm, etc.) just get set as the <video> src.
-// .m3u/.m3u8 links are HLS playlists, which browsers don't play natively
-// (except Safari), so those go through hls.js, loaded on demand from a CDN
-// only when actually needed.
+// Genuine HLS streams (.m3u8 media/master playlists for ONE video) go
+// through hls.js, loaded on demand from a CDN, except on Safari which plays
+// them natively.
+//
+// A lot of "m3u8 links" people actually paste in are IPTV-style channel
+// *lists* though — a playlist file whose #EXTINF entries each point to a
+// totally different stream (one per channel), rather than being the stream
+// itself. Those need to be fetched and parsed so we know there are multiple
+// channels to switch between; see parseChannelList().
 let hls = null;
 
-function isM3ULink(url){
-  return /\.m3u8?(\?|#|$)/i.test(url);
+// Deliberately broad: covers plain .m3u/.m3u8 links, ones with a query
+// string after the extension, and the common Xtream-Codes-style
+// "get.php?...type=m3u_plus..." links that don't have an .m3u8 extension
+// at all but still return one. False positives here are harmless — we only
+// use this to decide whether it's worth fetching+sniffing the body; actual
+// playback decisions come from what's really in that body.
+function looksLikeM3U(url){
+  return /\.m3u8?(\?|#|$)/i.test(url) || /[?&]type=m3u/i.test(url) || /get\.php\?/i.test(url);
+}
+
+// A real HLS playlist (master or media) is also #EXTM3U, so "starts with
+// #EXTM3U" alone doesn't tell channel lists and genuine streams apart.
+// Master/media playlists carry HLS-specific tags (#EXT-X-STREAM-INF for a
+// master listing bitrates of the SAME video, #EXT-X-TARGETDURATION for a
+// media playlist listing that video's segments) — an IPTV channel list has
+// neither, just repeated #EXTINF/url pairs pointing at unrelated channels.
+function parseChannelList(text){
+  if (!/^\s*#EXTM3U/.test(text)) return null;
+  if (/#EXT-X-STREAM-INF|#EXT-X-TARGETDURATION/.test(text)) return null;
+  const lines = text.split(/\r?\n/);
+  const channels = [];
+  for (let i = 0; i < lines.length; i++){
+    const line = lines[i].trim();
+    if (!line.startsWith('#EXTINF')) continue;
+    const name = (line.split(',').pop() || '').trim();
+    let j = i + 1;
+    while (j < lines.length && (lines[j].trim() === '' || lines[j].trim().startsWith('#'))) j++;
+    const url = lines[j] && lines[j].trim();
+    if (url) channels.push({ name: name || ('Channel ' + (channels.length + 1)), url });
+  }
+  return channels.length > 1 ? channels : null;
+}
+
+// Plays a single media URL on the <video> element — either a direct file
+// (.mp4/.webm/etc.) or a genuine HLS stream (native on Safari, hls.js
+// elsewhere). This is the shared bottom layer for both loadStreamUrl()
+// (first load) and tuneToChannel() (Up/Down switching within a loaded list).
+async function playMediaUrl(url){
+  if (hls){ hls.destroy(); hls = null; }
+  vid.pause();
+  vid.removeAttribute('src');
+  vid.load();
+
+  if (looksLikeM3U(url)){
+    if (vid.canPlayType('application/vnd.apple.mpegurl')){
+      // Native HLS support (Safari) — no library needed.
+      vid.src = url;
+      await vid.play();
+    } else {
+      const { default: Hls } = await import('https://cdn.jsdelivr.net/npm/hls.js@1/+esm');
+      if (!Hls.isSupported()) throw new Error('HLS not supported in this browser');
+      hls = new Hls();
+      hls.loadSource(url);
+      hls.attachMedia(vid);
+      await new Promise((resolve, reject) => {
+        hls.on(Hls.Events.MANIFEST_PARSED, resolve);
+        hls.on(Hls.Events.ERROR, (_evt, data) => { if (data.fatal) reject(new Error(data.type)); });
+      });
+      await vid.play();
+    }
+  } else {
+    // Anything else — .mp4, .webm, etc. — is just a normal video src.
+    vid.src = url;
+    await vid.play();
+  }
+}
+
+async function tuneToChannel(index){
+  if (!channelList || !channelList[index]) return;
+  channelIndex = index;
+  const ch = channelList[index];
+  streamStatus.textContent = 'Loading ' + ch.name + '…';
+  try {
+    await playMediaUrl(ch.url);
+    streamStatus.textContent = 'Playing: ' + ch.name;
+  } catch (err){
+    console.error('Failed to tune channel:', ch.name, err);
+    streamStatus.textContent = 'Couldn\'t load "' + ch.name + '"';
+  }
+}
+
+// Up/Down while sat at the TV step through a loaded channel list. No-op if
+// nothing multi-channel is currently loaded.
+function changeChannelBy(delta){
+  if (!channelList || channelList.length < 2) return;
+  const next = (channelIndex + delta + channelList.length) % channelList.length;
+  channelShownAt = performance.now();
+  flashStatic(350);
+  tuneToChannel(next);
 }
 
 async function loadStreamUrl(url){
@@ -924,35 +1046,31 @@ async function loadStreamUrl(url){
   if (!url) return;
   streamStatus.textContent = 'Loading…';
   flashStatic(350);
+  channelList = null;
 
-  if (hls){ hls.destroy(); hls = null; }
-  vid.pause();
-  vid.removeAttribute('src');
-  vid.load();
+  // If this smells like an m3u/m3u8 link, fetch its actual contents first —
+  // that's the only reliable way to tell "one HLS stream" from "a list of
+  // many channels" apart, since both share the same file extension (or, for
+  // Xtream-Codes-style get.php links, no extension at all). If the fetch
+  // fails (e.g. blocked by CORS, which many IPTV hosts don't set), we just
+  // fall through and hand the raw URL to playMediaUrl() as before.
+  if (looksLikeM3U(url)){
+    try {
+      const res = await fetch(url);
+      const text = await res.text();
+      const parsed = parseChannelList(text);
+      if (parsed){
+        channelList = parsed;
+        await tuneToChannel(0);
+        return;
+      }
+    } catch (err){
+      console.warn('Could not fetch playlist to check for a channel list (likely CORS) — trying direct playback:', err);
+    }
+  }
 
   try {
-    if (isM3ULink(url)){
-      if (vid.canPlayType('application/vnd.apple.mpegurl')){
-        // Native HLS support (Safari) — no library needed.
-        vid.src = url;
-        await vid.play();
-      } else {
-        const { default: Hls } = await import('https://cdn.jsdelivr.net/npm/hls.js@1/+esm');
-        if (!Hls.isSupported()) throw new Error('HLS not supported in this browser');
-        hls = new Hls();
-        hls.loadSource(url);
-        hls.attachMedia(vid);
-        await new Promise((resolve, reject) => {
-          hls.on(Hls.Events.MANIFEST_PARSED, resolve);
-          hls.on(Hls.Events.ERROR, (_evt, data) => { if (data.fatal) reject(new Error(data.type)); });
-        });
-        await vid.play();
-      }
-    } else {
-      // Anything else — .mp4, .webm, etc. — is just a normal video src.
-      vid.src = url;
-      await vid.play();
-    }
+    await playMediaUrl(url);
     streamStatus.textContent = 'Playing';
   } catch (err){
     console.error('Failed to load stream:', err);
@@ -963,6 +1081,22 @@ async function loadStreamUrl(url){
 document.getElementById('streamLoadBtn').addEventListener('click', () => loadStreamUrl(streamUrlInput.value));
 streamUrlInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') loadStreamUrl(streamUrlInput.value);
+});
+
+// While sat at the TV, Up/Down (plus W/S, and Z since AZERTY swaps W<->Z)
+// step through a loaded channel list. Clicking the screen (surfChannel(),
+// bound elsewhere) is deliberately separate — it only re-seeks whatever's
+// currently loaded and never changes `channelIndex`.
+document.addEventListener('keydown', (e) => {
+  if (mode !== 'tv') return;
+  switch (e.code){
+    case 'ArrowUp': case 'KeyW': case 'KeyZ':
+      changeChannelBy(1);
+      break;
+    case 'ArrowDown': case 'KeyS':
+      changeChannelBy(-1);
+      break;
+  }
 });
 
 // ---- Smooth hand-off between free-roam and TV view ----
