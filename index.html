@@ -1,0 +1,1223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>3D TV Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#111; }
+  #container { position:absolute; inset:0; }
+  #hint {
+    position:absolute; bottom:16px; left:50%; transform:translateX(-50%);
+    color:#ddd; font-family:sans-serif; font-size:13px; opacity:0.7;
+    pointer-events:none; text-align:center;
+  }
+  #loading {
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    color:#fff; font-family:sans-serif; font-size:16px; background:#111; z-index:10;
+  }
+  #unmute {
+    position:absolute; top:16px; right:16px; z-index:5;
+    background:rgba(0,0,0,0.5); color:#fff; border:1px solid #666;
+    padding:8px 14px; border-radius:6px; font-family:sans-serif; font-size:13px;
+    cursor:pointer;
+  }
+  #srcCanvas, #crtCanvas { display:none; }
+  #streamPanel {
+    position:absolute; top:50%; right:4%; transform:translateY(-50%);
+    z-index:6; width:230px; font-family:sans-serif; color:#eee;
+    background:rgba(15,15,15,0.72); border:1px solid #555; border-radius:10px;
+    padding:14px 16px; display:none; backdrop-filter: blur(2px);
+  }
+  #streamPanel label {
+    display:block; font-size:11px; opacity:0.75; margin-bottom:8px; line-height:1.4;
+  }
+  #streamPanel input {
+    width:100%; box-sizing:border-box; padding:7px 8px; border-radius:5px;
+    border:1px solid #666; background:#111; color:#eee; font-size:12px;
+  }
+  #streamPanel button {
+    margin-top:8px; width:100%; padding:7px; border-radius:5px; border:1px solid #666;
+    background:#242424; color:#eee; cursor:pointer; font-size:12px;
+  }
+  #streamPanel button:hover { background:#333; }
+  #streamStatus { margin-top:7px; font-size:11px; opacity:0.75; min-height:14px; }
+</style>
+</head>
+
+<body>
+<div id="container"></div>
+<div id="loading">Loading model…</div>
+<div id="hint">WASD to walk &middot; Click to look around &middot; Click the TV to sit down &middot; P to nudge placement</div>
+<div id="crosshair" style="position:absolute;top:50%;left:50%;width:6px;height:6px;margin:-3px 0 0 -3px;border-radius:50%;background:rgba(255,255,255,0.8);pointer-events:none;z-index:5;"></div>
+<button id="unmute">🔇 Unmute</button>
+
+<div id="streamPanel">
+  <label for="streamUrlInput">Play a link on the TV — .m3u/.m3u8 stream or a direct .mp4</label>
+  <input id="streamUrlInput" type="text" placeholder="https://example.com/video.mp4" autocomplete="off">
+  <button id="streamLoadBtn">Play</button>
+  <div id="streamStatus"></div>
+</div>
+
+<canvas id="srcCanvas" width="256" height="240"></canvas>
+<canvas id="crtCanvas" width="512" height="480"></canvas>
+<video id="vid" style="display:none" muted playsinline loop crossorigin="anonymous"></video>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
+import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUniformsLib.js";
+
+/* ---- PART 1: original CRT pipeline (video -> NES-res canvas -> WebGL shader) ---- */
+
+const vid = document.getElementById('vid');
+const src = document.getElementById('srcCanvas');
+const sctx = src.getContext('2d');
+const crtCanvas = document.getElementById('crtCanvas');
+
+// No default video baked in anymore — the screen just shows static/no-signal
+// until a link is loaded via the panel (see loadStreamUrl). Once something
+// IS loaded, jump to a random point in it whenever it (re)loads, same as before.
+vid.addEventListener('loadedmetadata', () => {
+  vid.currentTime = Math.random() * vid.duration;
+  vid.play().catch(()=>{});
+});
+
+// Channel surfing: click the screen while sitting at the TV to "flip" to a
+// fake channel number, with a brief static burst and a random seek into
+// whatever's currently loaded (nothing to seek into until a link is loaded,
+// in which case it's just a no-signal flicker — that's expected).
+let channelNum = 2 + (Math.random() * 82 | 0);
+let channelShownAt = performance.now();
+let staticUntil = 0;
+
+function flashStatic(durationMs){
+  staticUntil = performance.now() + durationMs;
+}
+
+function surfChannel(){
+  channelNum = 2 + (Math.random() * 82 | 0);
+  channelShownAt = performance.now();
+  flashStatic(350);
+  if (vid.readyState >= 2){
+    vid.currentTime = Math.random() * (vid.duration || 1);
+    vid.play().catch(()=>{});
+  }
+}
+
+function drawStatic(){
+  const id = sctx.createImageData(256, 240);
+  const d = id.data;
+  for(let i = 0; i < d.length; i += 4){
+    const v = Math.random() * 255 | 0;
+    d[i] = d[i+1] = d[i+2] = v;
+    d[i+3] = 255;
+  }
+  sctx.putImageData(id, 0, 0);
+}
+
+function drawChannelOSD(){
+  const age = performance.now() - channelShownAt;
+  const holdMs = 1800, fadeMs = 700;
+  if(age > holdMs + fadeMs) return;
+  const alpha = age <= holdMs ? 1 : 1 - (age - holdMs) / fadeMs;
+
+  const txt = 'CH ' + String(channelNum).padStart(2, '0');
+  sctx.save();
+  sctx.globalAlpha = alpha;
+  sctx.font = 'bold 32px "VT323", "Courier New", monospace';
+  sctx.textBaseline = 'top';
+  sctx.imageSmoothingEnabled = false;
+  const x = 256 - 10 - sctx.measureText(txt).width;
+  const y = 10;
+  sctx.fillStyle = '#000';
+  sctx.fillText(txt, x+2, y+2);
+  sctx.fillStyle = '#33ff33';
+  sctx.fillText(txt, x, y);
+  sctx.restore();
+}
+
+const NES_FPS = 60.0988;
+const frameMs = 1000 / NES_FPS;
+let lastDraw = 0;
+function captureLoop(t){
+  if(t - lastDraw >= frameMs){
+    lastDraw = t;
+    sctx.fillStyle = '#000';
+    sctx.fillRect(0, 0, 256, 240);
+    if(performance.now() < staticUntil){
+      drawStatic();
+    } else if(vid.readyState >= 2){
+      sctx.drawImage(vid, 0, 0, 256, 240);
+    }
+    drawChannelOSD();
+  }
+  requestAnimationFrame(captureLoop);
+}
+
+
+const W = 256, H = 240;
+let crtGl = crtCanvas.getContext('webgl') || crtCanvas.getContext('experimental-webgl');
+let crtProgram, crtTexture, crtUniforms, crtReady = false;
+
+function compileShader(gl, srcCode, type){
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, srcCode);
+  gl.compileShader(sh);
+  if(!gl.getShaderParameter(sh, gl.COMPILE_STATUS)){
+    console.warn('shader error:', gl.getShaderInfoLog(sh));
+    return null;
+  }
+  return sh;
+}
+
+function initCRT(){
+  const gl = crtGl;
+  if(!gl) return;
+  gl.getExtension('OES_standard_derivatives');
+
+  const vsSrc = `
+    attribute vec2 a_pos;
+    varying vec2 v_uv;
+    void main(){
+      v_uv = a_pos * 0.5 + 0.5;
+      gl_Position = vec4(a_pos, 0.0, 1.0);
+    }
+  `;
+  const fsSrc = `
+    #extension GL_OES_standard_derivatives : enable
+    precision mediump float;
+    varying vec2 v_uv;
+    uniform sampler2D u_tex;
+    uniform vec2 u_srcRes;
+    uniform float u_curvature;
+    uniform float u_scanline;
+    uniform float u_vignette;
+    uniform float u_mask;
+
+    vec2 barrel(vec2 uv, float k){
+      vec2 cc = uv - 0.5;
+      float r2 = dot(cc, cc);
+      return uv + cc * r2 * k;
+    }
+
+    void main(){
+      vec2 uv = barrel(v_uv, u_curvature);
+      if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0){
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+      }
+
+      vec2 caDir = (uv - 0.5) * 0.0028;
+      float r = texture2D(u_tex, uv + caDir).r;
+      float g = texture2D(u_tex, uv).g;
+      float b = texture2D(u_tex, uv - caDir).b;
+      vec3 color = vec3(r, g, b);
+
+      float sl = sin(uv.y * u_srcRes.y * 3.14159265);
+      float scanMul = mix(1.0, 0.45 + 0.55 * abs(sl), u_scanline);
+      color *= scanMul;
+
+      float col = mod(gl_FragCoord.x, 3.0);
+      vec3 maskColor = (col < 1.0) ? vec3(1.1, 0.85, 0.9)
+                      : (col < 2.0) ? vec3(0.85, 1.1, 0.85)
+                                    : vec3(0.9, 0.85, 1.1);
+      color *= mix(vec3(1.0), maskColor, u_mask);
+
+      vec2 vc = v_uv - 0.5;
+      float vig = 1.0 - dot(vc, vc) * u_vignette;
+      color *= vig;
+
+      gl_FragColor = vec4(color, 1.0);
+    }
+  `;
+
+  const vs = compileShader(gl, vsSrc, gl.VERTEX_SHADER);
+  const fs = compileShader(gl, fsSrc, gl.FRAGMENT_SHADER);
+  if(!vs || !fs) return;
+
+  crtProgram = gl.createProgram();
+  gl.attachShader(crtProgram, vs);
+  gl.attachShader(crtProgram, fs);
+  gl.linkProgram(crtProgram);
+  if(!gl.getProgramParameter(crtProgram, gl.LINK_STATUS)){
+    console.warn('link error:', gl.getProgramInfoLog(crtProgram));
+    return;
+  }
+
+  const quad = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(crtProgram, 'a_pos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  crtTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, crtTexture);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  crtUniforms = {
+    tex: gl.getUniformLocation(crtProgram, 'u_tex'),
+    srcRes: gl.getUniformLocation(crtProgram, 'u_srcRes'),
+    curvature: gl.getUniformLocation(crtProgram, 'u_curvature'),
+    scanline: gl.getUniformLocation(crtProgram, 'u_scanline'),
+    vignette: gl.getUniformLocation(crtProgram, 'u_vignette'),
+    mask: gl.getUniformLocation(crtProgram, 'u_mask')
+  };
+  crtReady = true;
+}
+initCRT();
+
+function drawCRTFrame(){
+  if(!crtReady) return;
+  const gl = crtGl;
+  gl.viewport(0, 0, crtCanvas.width, crtCanvas.height);
+  gl.useProgram(crtProgram);
+  gl.bindTexture(gl.TEXTURE_2D, crtTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+  gl.uniform1i(crtUniforms.tex, 0);
+  gl.uniform2f(crtUniforms.srcRes, W, H);
+  gl.uniform1f(crtUniforms.curvature, 0.30);
+  gl.uniform1f(crtUniforms.scanline, 0.55);
+  gl.uniform1f(crtUniforms.vignette, 0.30);
+  gl.uniform1f(crtUniforms.mask, 0.20);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+requestAnimationFrame(captureLoop);
+
+document.getElementById('unmute').addEventListener('click', (e) => {
+  vid.muted = !vid.muted;
+  e.target.textContent = vid.muted ? "🔇 Unmute" : "🔊 Mute";
+});
+
+/* ---- PART 2: Three.js scene, CRT canvas mapped onto the 3D "Screen" mesh ---- */
+
+RectAreaLightUniformsLib.init();
+
+const container = document.getElementById('container');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a1a);
+
+// ---- 3D house the TV sits inside, loaded from Duplex.glb (next to index.html,
+// same as model.dae). Its embedded texture reference resolves against the
+// textures/ folder for consistency with the TV's own PBR textures.
+// The house's own units are almost certainly a different scale than the
+// arbitrary units the TV is normalized to (targetSize below), so it needs to
+// be scaled up/down and have its floor lined up with the TV's base —
+// otherwise it renders as either a speck or a wall filling the whole screen.
+// HOUSE_SCALE, HOUSE_FLOOR_Y, and HOUSE_OFFSET_X/Z are guesses; tune them the
+// same way as the camera height/distance (open devtools, check the logged
+// native size, adjust, refresh), then send me the final numbers.
+const HOUSE_SCALE = 40;
+const HOUSE_FLOOR_Y = -20;
+const HOUSE_OFFSET_X = 0;
+const HOUSE_OFFSET_Z = 0;
+
+// ---- Where the TV sits inside the house. Tuned the same way as the house
+// constants above: open devtools, walk around in free-roam, and adjust these
+// until the TV is resting against a wall/on a stand at a sensible spot.
+// TV_POSITION is a world-space offset added AFTER the model is centered and
+// scaled, so it's independent of the model's own internal pivot.
+// TV_ROTATION_Y (radians) turns the TV to face out into the room.
+const TV_POSITION = new THREE.Vector3(-125, 17, -92);
+// If you rotate the TV, the TV-mode camera approach below (which assumes the
+// screen faces +Z, same as the original fixed viewer) needs updating too.
+let TV_ROTATION_Y = 0;
+
+// ---- Collision registry ----
+// Anything the free-roam camera should collide with (can't walk through,
+// stands on) gets pushed here once its model has loaded. Used by tryMove()/
+// applyFloorSnap() further down.
+const collidables = [];
+
+// Imported architectural meshes (like the house) are often modeled to be
+// seen only from inside a room, with normals/winding facing that way — which
+// means a collision raycast approaching a wall from "outside" can miss it
+// entirely (the raycaster culls backfaces the same way rendering does).
+// Forcing DoubleSide here fixes that for collision purposes and is harmless
+// visually for solid walls/furniture.
+function makeCollidable(object3D){
+  object3D.traverse((child) => {
+    if (!child.isMesh || !child.material) return;
+    if (Array.isArray(child.material)) child.material.forEach(m => { m.side = THREE.DoubleSide; });
+    else child.material.side = THREE.DoubleSide;
+  });
+  collidables.push(object3D);
+}
+
+// ---- Generic "placeable items" registry ----
+// Anything nudge-able in placement mode (TV, TV stand, and anything added
+// later) gets registered here once its model has loaded. `placement` is the
+// tunable world-space offset (what nudging changes); `basePosition` is the
+// model's own one-time centering offset and is never touched after load.
+const placeableItems = [];
+
+function registerPlaceable(name, object3D, placement, rotationY){
+  const item = {
+    name,
+    object: object3D,
+    basePosition: object3D.position.clone(),
+    placement,
+    rotationY
+  };
+  placeableItems.push(item);
+  applyPlaceableTransform(item);
+  return item;
+}
+
+function applyPlaceableTransform(item){
+  item.object.position.copy(item.basePosition).add(item.placement);
+  item.object.rotation.y = item.rotationY;
+}
+
+const houseLoader = new GLTFLoader();
+houseLoader.setResourcePath('textures/');
+houseLoader.load('Duplex.glb', (gltf) => {
+  const house = gltf.scene;
+
+  const box = new THREE.Box3().setFromObject(house);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+
+  house.scale.setScalar(HOUSE_SCALE);
+  house.position.set(
+    HOUSE_OFFSET_X - HOUSE_SCALE * center.x,
+    HOUSE_FLOOR_Y - HOUSE_SCALE * box.min.y,
+    HOUSE_OFFSET_Z - HOUSE_SCALE * center.z
+  );
+
+  scene.add(house);
+  makeCollidable(house);
+  console.log('House native size:', size, '-> scaled size:', size.clone().multiplyScalar(HOUSE_SCALE));
+}, undefined, (err) => {
+  console.error('Error loading Duplex.glb:', err);
+});
+
+// TV Stand intentionally not loaded — skipping TVStand.glb entirely to save
+// on load time / GPU memory. Re-add a loader here if it's ever needed again.
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(0, -2, 60);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+container.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
+keyLight.position.set(5, 8, 10);
+scene.add(keyLight);
+const fillLight = new THREE.DirectionalLight(0xffffff, 0.4);
+fillLight.position.set(-6, -2, -8);
+scene.add(fillLight);
+
+// ---- Screen "light spill": the screen itself is an unlit MeshBasicMaterial,
+// so by default it doesn't cast any light onto the bezel/edges around it like
+// a real CRT glow does. A RectAreaLight sized to the screen and colored from
+// a live sample of the picture fakes that spill onto the TV's front shell.
+let screenGlowLight = null;
+let screenGlowNormal = new THREE.Vector3(0, 0, 1);
+const glowSampleCanvas = document.createElement('canvas');
+glowSampleCanvas.width = 8;
+glowSampleCanvas.height = 8;
+const glowSampleCtx = glowSampleCanvas.getContext('2d', { willReadFrequently: true });
+
+function sampleScreenColor(){
+  glowSampleCtx.drawImage(crtCanvas, 0, 0, 8, 8);
+  const data = glowSampleCtx.getImageData(0, 0, 8, 8).data;
+  let r = 0, g = 0, b = 0;
+  const n = data.length / 4;
+  for (let i = 0; i < data.length; i += 4){
+    r += data[i]; g += data[i + 1]; b += data[i + 2];
+  }
+  return { r: r / n / 255, g: g / n / 255, b: b / n / 255 };
+}
+
+function computeMeshNormal(mesh){
+  const geo = mesh.geometry;
+  const normalAttr = geo.attributes.normal;
+  const normal = new THREE.Vector3(0, 0, 1);
+  if (normalAttr && normalAttr.count){
+    normal.set(0, 0, 0);
+    for (let i = 0; i < normalAttr.count; i++){
+      normal.x += normalAttr.getX(i);
+      normal.y += normalAttr.getY(i);
+      normal.z += normalAttr.getZ(i);
+    }
+    normal.divideScalar(normalAttr.count);
+    if (normal.lengthSq() < 1e-6) normal.set(0, 0, 1);
+    normal.normalize();
+  }
+  const normalMatrix = new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld);
+  return normal.applyMatrix3(normalMatrix).normalize();
+}
+
+function setupScreenGlow(mesh){
+  mesh.updateWorldMatrix(true, false);
+  screenGlowNormal = computeMeshNormal(mesh);
+
+  const box = new THREE.Box3().setFromObject(mesh);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+
+  // Approximate the screen's width/height as the two largest dimensions of
+  // its bounding box (the smallest one is the thin "depth" axis).
+  const dims = [size.x, size.y, size.z].sort((a, b) => a - b);
+  const glowWidth = dims[2];
+  const glowHeight = dims[1];
+
+  screenGlowLight = new THREE.RectAreaLight(0xffffff, 0, glowWidth, glowHeight);
+  screenGlowLight.position.copy(center).addScaledVector(screenGlowNormal, Math.max(glowWidth, glowHeight) * 0.08);
+  screenGlowLight.lookAt(center.clone().addScaledVector(screenGlowNormal, 1));
+  scene.add(screenGlowLight);
+
+  // A small point light fills in softer, omnidirectional bounce that the
+  // directional RectAreaLight alone won't reach around tight bezel corners.
+  screenGlowLight.userData.fillLight = new THREE.PointLight(0xffffff, 0, glowWidth * 3);
+  screenGlowLight.userData.fillLight.position.copy(screenGlowLight.position);
+  scene.add(screenGlowLight.userData.fillLight);
+}
+
+let glowFrame = 0;
+function updateScreenGlow(){
+  if (!screenGlowLight) return;
+  glowFrame++;
+  if (glowFrame % 3 !== 0) return; // sampling every frame is unnecessary work
+
+  const { r, g, b } = sampleScreenColor();
+  const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+  screenGlowLight.color.setRGB(Math.max(r, 0.01), Math.max(g, 0.01), Math.max(b, 0.01));
+  screenGlowLight.intensity = luminance * 6.0;
+
+  const fill = screenGlowLight.userData.fillLight;
+  fill.color.copy(screenGlowLight.color);
+  fill.intensity = luminance * 4.0;
+}
+
+// ---- Three camera modes ----
+// 'freeroam'      : walk around the room, WASD + mouse look (pointer lock)
+// 'tv'            : the old fixed-axis viewer, locked onto the TV screen
+// 'transitioning' : a short animated hand-off between the two above
+let mode = 'freeroam';
+
+const tvControls = new OrbitControls(camera, renderer.domElement);
+tvControls.enableDamping = true;
+tvControls.dampingFactor = 0.08;
+tvControls.minDistance = 10;
+tvControls.maxDistance = 200;
+
+// Only height (vertical position) and zoom (distance) are adjustable.
+// Rotation is fully disabled — drag pans the camera+target straight up/down
+// instead of orbiting, so the TV never spins or tilts. Left/right drift is
+// clamped to zero every frame as a safety net.
+tvControls.enableRotate = false;
+tvControls.enablePan = true;
+tvControls.screenSpacePanning = true;
+tvControls.panSpeed = 1.2;
+tvControls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+tvControls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_PAN };
+tvControls.enabled = false;
+
+// The TV camera's height/distance are remembered here across mode switches,
+// so leaving and re-entering the TV view puts the camera right back where
+// you left it, instead of resetting.
+const savedTVCamera = {
+  height: 40,
+  distance: 120,
+  targetX: 0,
+  targetZ: 0
+};
+
+const freeRoamControls = new PointerLockControls(camera, renderer.domElement);
+const freeRoamStart = new THREE.Vector3(136, 40, 92);
+camera.position.copy(freeRoamStart);
+camera.rotation.set(0, Math.PI / 2, 0); // face west (default forward is north)
+
+// Exact free-roam camera pose (position + facing) at the moment you step up
+// to the TV — restored exactly when you step away again, so your height and
+// facing direction come back correctly instead of resetting to a default.
+const savedFreeRoam = {
+  pos: freeRoamStart.clone(),
+  quat: camera.quaternion.clone()
+};
+
+const moveState = { forward: false, back: false, left: false, right: false, up: false, down: false };
+const WALK_SPEED = 60; // world units / second
+const clock = new THREE.Clock();
+
+function onKeyDown(e){
+  switch (e.code){
+    case 'KeyW': case 'ArrowUp': moveState.forward = true; break;
+    case 'KeyS': case 'ArrowDown': moveState.back = true; break;
+    case 'KeyA': case 'ArrowLeft': moveState.left = true; break;
+    case 'KeyD': case 'ArrowRight': moveState.right = true; break;
+    // Space/Shift just set the flag here; updateFreeRoam() only actually
+    // acts on up/down when placementMode is on, so they're inert otherwise.
+    case 'Space': moveState.up = true; break;
+    case 'ShiftLeft': case 'ShiftRight': moveState.down = true; break;
+    case 'Escape': if (mode === 'tv') exitTVMode(); break;
+  }
+}
+function onKeyUp(e){
+  switch (e.code){
+    case 'KeyW': case 'ArrowUp': moveState.forward = false; break;
+    case 'KeyS': case 'ArrowDown': moveState.back = false; break;
+    case 'KeyA': case 'ArrowLeft': moveState.left = false; break;
+    case 'KeyD': case 'ArrowRight': moveState.right = false; break;
+    case 'Space': moveState.up = false; break;
+    case 'ShiftLeft': case 'ShiftRight': moveState.down = false; break;
+  }
+}
+document.addEventListener('keydown', onKeyDown);
+document.addEventListener('keyup', onKeyUp);
+
+// ---- Live placement mode ----
+// Press P (in free-roam) to toggle it, Tab to switch which registered item
+// you're moving (TV, TV Stand, anything added later). While it's on:
+//   I / K / J / L  — move forward / back / left / right
+//   U / O          — move up / down
+//   N / M          — rotate
+// The HUD shows the running placement/rotation for whichever item is
+// selected — once it looks right, copy those numbers into that item's
+// constants up top.
+let placementMode = false;
+let activeItemIndex = 0;
+const PLACEMENT_MOVE_SPEED = 20;  // units / second
+const PLACEMENT_ROTATE_SPEED = 1; // radians / second
+const placementState = { fwd: false, back: false, left: false, right: false, up: false, down: false, rotL: false, rotR: false };
+
+// Deliberately NOT on WASD/arrows — those already walk the character, so
+// reusing them for placement would move you and the item at the same time.
+function onPlacementKeyDown(e){
+  if (e.code === 'KeyP'){ placementMode = !placementMode; return; }
+  if (!placementMode) return;
+  if (e.code === 'Tab'){
+    e.preventDefault();
+    if (placeableItems.length > 0) activeItemIndex = (activeItemIndex + 1) % placeableItems.length;
+    return;
+  }
+  switch (e.code){
+    case 'KeyI': placementState.fwd = true; e.preventDefault(); break;
+    case 'KeyK': placementState.back = true; e.preventDefault(); break;
+    case 'KeyJ': placementState.left = true; e.preventDefault(); break;
+    case 'KeyL': placementState.right = true; e.preventDefault(); break;
+    case 'KeyU': placementState.up = true; e.preventDefault(); break;
+    case 'KeyO': placementState.down = true; e.preventDefault(); break;
+    case 'KeyN': placementState.rotL = true; break;
+    case 'KeyM': placementState.rotR = true; break;
+  }
+}
+function onPlacementKeyUp(e){
+  switch (e.code){
+    case 'KeyI': placementState.fwd = false; break;
+    case 'KeyK': placementState.back = false; break;
+    case 'KeyJ': placementState.left = false; break;
+    case 'KeyL': placementState.right = false; break;
+    case 'KeyU': placementState.up = false; break;
+    case 'KeyO': placementState.down = false; break;
+    case 'KeyN': placementState.rotL = false; break;
+    case 'KeyM': placementState.rotR = false; break;
+  }
+}
+document.addEventListener('keydown', onPlacementKeyDown);
+document.addEventListener('keyup', onPlacementKeyUp);
+
+function updatePlacement(delta){
+  if (!placementMode || placeableItems.length === 0) return;
+  const item = placeableItems[activeItemIndex];
+  const step = PLACEMENT_MOVE_SPEED * delta;
+  if (placementState.fwd) item.placement.z -= step;
+  if (placementState.back) item.placement.z += step;
+  if (placementState.left) item.placement.x -= step;
+  if (placementState.right) item.placement.x += step;
+  if (placementState.up) item.placement.y += step;
+  if (placementState.down) item.placement.y -= step;
+  if (placementState.rotL) item.rotationY -= PLACEMENT_ROTATE_SPEED * delta;
+  if (placementState.rotR) item.rotationY += PLACEMENT_ROTATE_SPEED * delta;
+  applyPlaceableTransform(item);
+}
+
+// ---- Collision ----
+// Lightweight FPS-style collision against everything in `collidables`
+// (house + TV): horizontal movement gets blocked/slid along walls instead of
+// passing through them, and — outside placement mode — height snaps down
+// onto whatever floor is under the camera instead of letting you fly. It's
+// raycast-based rather than true physics, so it's cheap but not perfect;
+// tune COLLIDER_SKIN / EYE_HEIGHT below if you clip through thin geometry or
+// end up floating/sinking relative to the floor.
+const COLLIDER_SKIN = 6;      // how close to a wall the camera is allowed to get
+const EYE_HEIGHT = 56;        // how high the camera sits above whatever floor it's on
+const FLOOR_SNAP_SPEED = 10;  // how fast height corrects toward the floor each second
+const MAX_STEP_UP = 12;       // floors taller than this above you read as a wall, not a step
+const collisionRay = new THREE.Raycaster();
+
+function tryMove(deltaVec){
+  if (collidables.length === 0 || deltaVec.lengthSq() < 1e-8){
+    camera.position.add(deltaVec);
+    return;
+  }
+  const dist = deltaVec.length();
+  const dir = deltaVec.clone().divideScalar(dist);
+  collisionRay.set(camera.position, dir);
+  collisionRay.far = dist + COLLIDER_SKIN;
+  const hits = collisionRay.intersectObjects(collidables, true);
+  if (hits.length > 0 && hits[0].distance < dist + COLLIDER_SKIN){
+    // Wall ahead — slide along it instead of just stopping dead.
+    let normal = dir.clone().negate();
+    if (hits[0].face){
+      normal = hits[0].face.normal.clone()
+        .transformDirection(hits[0].object.matrixWorld)
+        .normalize();
+    }
+    const slid = deltaVec.clone().sub(normal.multiplyScalar(deltaVec.dot(normal)));
+    camera.position.add(slid);
+  } else {
+    camera.position.add(deltaVec);
+  }
+}
+
+function applyFloorSnap(delta){
+  if (collidables.length === 0) return;
+  collisionRay.set(
+    new THREE.Vector3(camera.position.x, camera.position.y + 40, camera.position.z),
+    new THREE.Vector3(0, -1, 0)
+  );
+  collisionRay.far = 500;
+  const hits = collisionRay.intersectObjects(collidables, true);
+  if (hits.length === 0) return; // no floor detected under us — leave height alone
+  const targetY = hits[0].point.y + EYE_HEIGHT;
+  const rise = targetY - camera.position.y;
+  // Anything taller than a small step reads as a wall/obstacle, not a floor —
+  // without this, the snap would happily hoist you up and over anything
+  // solid the horizontal collision failed to fully stop, which is exactly
+  // the "climbing over walls" bug this is here to prevent.
+  if (rise > MAX_STEP_UP) return;
+  camera.position.y += rise * Math.min(1, FLOOR_SNAP_SPEED * delta);
+}
+
+function updateFreeRoam(delta){
+  const step = WALK_SPEED * delta;
+  const startPos = camera.position.clone();
+
+  if (moveState.forward) freeRoamControls.moveForward(step);
+  if (moveState.back) freeRoamControls.moveForward(-step);
+  if (moveState.right) freeRoamControls.moveRight(step);
+  if (moveState.left) freeRoamControls.moveRight(-step);
+
+  const horizontalDelta = camera.position.clone().sub(startPos);
+  camera.position.copy(startPos);
+  tryMove(horizontalDelta);
+
+  if (placementMode){
+    // Free vertical fly (Space/Shift) is only available while placing items,
+    // so you can move the camera to see what you're positioning. The rest of
+    // the time height is handled by applyFloorSnap() instead.
+    if (moveState.up) camera.position.y += step;
+    if (moveState.down) camera.position.y -= step;
+  } else {
+    applyFloorSnap(delta);
+  }
+}
+
+const camHud = document.createElement('div');
+camHud.id = 'camHud';
+camHud.style.cssText = 'position:absolute;bottom:16px;left:16px;z-index:5;color:#9f9;font-family:monospace;font-size:12px;background:rgba(0,0,0,0.5);padding:6px 10px;border-radius:6px;pointer-events:none;white-space:pre;';
+document.body.appendChild(camHud);
+
+const crosshairEl = document.getElementById('crosshair');
+const hintEl = document.getElementById('hint');
+const streamPanel = document.getElementById('streamPanel');
+const streamUrlInput = document.getElementById('streamUrlInput');
+const streamStatus = document.getElementById('streamStatus');
+
+// ---- Loading a user-supplied link onto the TV ----
+// Direct video files (.mp4, .webm, etc.) just get set as the <video> src.
+// .m3u/.m3u8 links are HLS playlists, which browsers don't play natively
+// (except Safari), so those go through hls.js, loaded on demand from a CDN
+// only when actually needed.
+let hls = null;
+
+function isM3ULink(url){
+  return /\.m3u8?(\?|#|$)/i.test(url);
+}
+
+async function loadStreamUrl(url){
+  url = url.trim();
+  if (!url) return;
+  streamStatus.textContent = 'Loading…';
+  flashStatic(350);
+
+  if (hls){ hls.destroy(); hls = null; }
+  vid.pause();
+  vid.removeAttribute('src');
+  vid.load();
+
+  try {
+    if (isM3ULink(url)){
+      if (vid.canPlayType('application/vnd.apple.mpegurl')){
+        // Native HLS support (Safari) — no library needed.
+        vid.src = url;
+        await vid.play();
+      } else {
+        const { default: Hls } = await import('https://cdn.jsdelivr.net/npm/hls.js@1/+esm');
+        if (!Hls.isSupported()) throw new Error('HLS not supported in this browser');
+        hls = new Hls();
+        hls.loadSource(url);
+        hls.attachMedia(vid);
+        await new Promise((resolve, reject) => {
+          hls.on(Hls.Events.MANIFEST_PARSED, resolve);
+          hls.on(Hls.Events.ERROR, (_evt, data) => { if (data.fatal) reject(new Error(data.type)); });
+        });
+        await vid.play();
+      }
+    } else {
+      // Anything else — .mp4, .webm, etc. — is just a normal video src.
+      vid.src = url;
+      await vid.play();
+    }
+    streamStatus.textContent = 'Playing';
+  } catch (err){
+    console.error('Failed to load stream:', err);
+    streamStatus.textContent = 'Couldn\'t load that link';
+  }
+}
+
+document.getElementById('streamLoadBtn').addEventListener('click', () => loadStreamUrl(streamUrlInput.value));
+streamUrlInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') loadStreamUrl(streamUrlInput.value);
+});
+
+// ---- Smooth hand-off between free-roam and TV view ----
+// Rather than snapping the camera instantly, we animate position + facing
+// from wherever it currently is to the destination pose over a short window.
+const TRANSITION_DURATION = 0.6; // seconds
+let transitionT = 1; // 1 = idle/finished
+let pendingMode = null;
+const transitionFrom = { pos: new THREE.Vector3(), quat: new THREE.Quaternion() };
+const transitionTo = { pos: new THREE.Vector3(), quat: new THREE.Quaternion() };
+const lookAtMatrix = new THREE.Matrix4();
+
+function quatLookingAt(fromPos, toPos){
+  lookAtMatrix.lookAt(fromPos, toPos, camera.up);
+  return new THREE.Quaternion().setFromRotationMatrix(lookAtMatrix);
+}
+
+function startTransition(toPos, toQuat, finalMode){
+  transitionFrom.pos.copy(camera.position);
+  transitionFrom.quat.copy(camera.quaternion);
+  transitionTo.pos.copy(toPos);
+  transitionTo.quat.copy(toQuat);
+  transitionT = 0;
+  pendingMode = finalMode;
+  mode = 'transitioning';
+  tvControls.enabled = false;
+  if (document.pointerLockElement) freeRoamControls.unlock();
+  crosshairEl.style.display = 'none';
+  hintEl.textContent = '';
+  streamPanel.style.display = 'none';
+}
+
+function updateTransition(delta){
+  transitionT = Math.min(transitionT + delta / TRANSITION_DURATION, 1);
+  const eased = transitionT * transitionT * (3 - 2 * transitionT); // smoothstep
+  camera.position.lerpVectors(transitionFrom.pos, transitionTo.pos, eased);
+  camera.quaternion.slerpQuaternions(transitionFrom.quat, transitionTo.quat, eased);
+  if (transitionT >= 1) finishTransition();
+}
+
+function finishTransition(){
+  if (pendingMode === 'tv'){
+    mode = 'tv';
+    tvControls.target.set(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ);
+    tvControls.enabled = true;
+    tvControls.update();
+    hintEl.textContent = 'Drag to adjust height · Scroll to zoom · Click the screen to surf channels · Paste a link on the right to play it · Click away to get up';
+    streamPanel.style.display = 'block';
+  } else {
+    mode = 'freeroam';
+    crosshairEl.style.display = '';
+    hintEl.textContent = 'WASD to walk · Click to look around · Click the TV to sit down · P to nudge placement';
+  }
+  pendingMode = null;
+}
+
+function enterTVMode(){
+  // Remember exactly where — and which way — we were standing, so exiting
+  // later restores this precisely instead of resetting to a fixed height.
+  savedFreeRoam.pos.copy(camera.position);
+  savedFreeRoam.quat.copy(camera.quaternion);
+
+  const toPos = new THREE.Vector3(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ + savedTVCamera.distance);
+  const toTarget = new THREE.Vector3(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ);
+  const toQuat = quatLookingAt(toPos, toTarget);
+  startTransition(toPos, toQuat, 'tv');
+}
+
+function exitTVMode(){
+  tvControls.enabled = false;
+  startTransition(savedFreeRoam.pos, savedFreeRoam.quat, 'freeroam');
+  // Re-lock the pointer right away (still inside this click's user-gesture
+  // window) so mouse-look works the instant you land back in free-roam,
+  // instead of leaving the cursor free and needing a second click.
+  // updateTransition() overwrites camera.quaternion every frame during the
+  // transition anyway, so any look input landing before it finishes is
+  // harmlessly discarded rather than fighting the animation.
+  freeRoamControls.lock();
+}
+
+function lockAndReportCamera(){
+  if (mode === 'tv'){
+    // Force out any horizontal drift from diagonal drags.
+    camera.position.x = savedTVCamera.targetX;
+    tvControls.target.x = savedTVCamera.targetX;
+    tvControls.target.z = savedTVCamera.targetZ;
+
+    savedTVCamera.height = camera.position.y;
+    savedTVCamera.distance = camera.position.distanceTo(tvControls.target);
+
+    const height = camera.position.y.toFixed(2);
+    const distance = camera.position.distanceTo(tvControls.target).toFixed(2);
+    camHud.textContent = `camera height: ${height}\ncamera distance: ${distance}`;
+  } else if (mode === 'freeroam') {
+    const p = camera.position;
+    let text = `x: ${p.x.toFixed(1)}  y: ${p.y.toFixed(1)}  z: ${p.z.toFixed(1)}`;
+    if (placementMode && placeableItems.length > 0){
+      const item = placeableItems[activeItemIndex];
+      text += `\n--- Placement (P to toggle, Tab to switch item) ---`;
+      text += `\nEditing: ${item.name} (${activeItemIndex + 1}/${placeableItems.length})`;
+      text += `\nposition: (${item.placement.x.toFixed(1)}, ${item.placement.y.toFixed(1)}, ${item.placement.z.toFixed(1)})`;
+      text += `\nrotationY: ${item.rotationY.toFixed(2)}`;
+      text += `\nIJKL: move · U/O: height · N/M: rotate · Tab: switch item`;
+    }
+    camHud.textContent = text;
+  }
+  // mode === 'transitioning': leave the HUD as it was, nothing to report mid-flight
+}
+
+// ---- Overscan: real CRTs shrink the raster inward from each edge, revealing
+// black border rather than cropping/zooming the picture. We composite the
+// CRT-shader output onto a second canvas at a smaller size, offset so it's
+// inset from whichever edges are dialed in, with black filling the rest.
+// That padded canvas — not crtCanvas directly — is what becomes the texture.
+const paddedCanvas = document.createElement('canvas');
+paddedCanvas.width = crtCanvas.width;
+paddedCanvas.height = crtCanvas.height;
+const paddedCtx = paddedCanvas.getContext('2d');
+
+const overscan = { top: 0.15, bottom: 0.15, left: 0.05, right: 0.05 };
+
+function drawPaddedFrame(){
+  const w = paddedCanvas.width, h = paddedCanvas.height;
+  paddedCtx.fillStyle = '#000';
+  paddedCtx.fillRect(0, 0, w, h);
+
+  const left = overscan.left * w;
+  const right = overscan.right * w;
+  const top = overscan.top * h;
+  const bottom = overscan.bottom * h;
+  const dw = Math.max(1, w - left - right);
+  const dh = Math.max(1, h - top - bottom);
+
+  paddedCtx.drawImage(crtCanvas, left, top, dw, dh);
+}
+
+const screenTexture = new THREE.CanvasTexture(paddedCanvas);
+screenTexture.colorSpace = THREE.SRGBColorSpace;
+screenTexture.minFilter = THREE.LinearFilter;
+screenTexture.magFilter = THREE.LinearFilter;
+
+let screenMesh = null;
+
+// ---- PBR texture sets for TVback / TVfront, loaded from textures/ folder ----
+const texLoader = new THREE.TextureLoader();
+
+function loadTex(path, srgb){
+  const t = texLoader.load(path);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+function buildPBRMaterial(prefix){
+  return new THREE.MeshStandardMaterial({
+    map:          loadTex(`textures/${prefix}_albedo.jpg`, true),
+    aoMap:        loadTex(`textures/${prefix}_AO.jpg`, false),
+    metalnessMap: loadTex(`textures/${prefix}_metallic.jpg`, false),
+    roughnessMap: loadTex(`textures/${prefix}_roughness.jpg`, false),
+    normalMap:    loadTex(`textures/${prefix}_normal.png`, false),
+    metalness: 1.0,
+    roughness: 1.0
+  });
+}
+
+const tvBackMaterial = buildPBRMaterial('TVback');
+const tvFrontMaterial = buildPBRMaterial('TVfront');
+
+// aoMap requires a second UV channel — clone uv into uv2 since these meshes
+// only have one UV set exported from the .dae
+function ensureUV2(mesh){
+  const geo = mesh.geometry;
+  if (geo && geo.attributes.uv && !geo.attributes.uv2) {
+    geo.setAttribute('uv2', geo.attributes.uv);
+  }
+}
+
+let tvModel = null;
+let tvOutlineMesh = null;
+
+// ---- "Inverted hull" toon outline ----
+// Classic cartoon-outline trick: render a second copy of the mesh, pushed
+// outward a hair along each vertex's own normal, with only its back faces
+// visible (front faces culled). Depth-testing then does the work for us —
+// the enlarged backfaces only peek out right at the model's silhouette edge,
+// reading as a clean outline that follows the object's actual shape instead
+// of a bounding box.
+const outlineMaterial = new THREE.ShaderMaterial({
+  uniforms: { outlineWidth: { value: 0.3 } },
+  vertexShader: `
+    uniform float outlineWidth;
+    void main(){
+      vec3 pos = position + normal * outlineWidth;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+    }
+  `,
+  fragmentShader: `
+    void main(){
+      gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+    }
+  `,
+  side: THREE.BackSide
+});
+
+const loader = new ColladaLoader();
+loader.load('model.dae', (collada) => {
+  const model = collada.scene;
+
+  model.traverse((child) => {
+    if (!child.isMesh) return;
+
+    if (/screen/i.test(child.name)) {
+      screenMesh = child;
+      return;
+    }
+
+    ensureUV2(child);
+    const matName = (child.material && child.material.name) || '';
+    if (/back/i.test(child.name) || /back/i.test(matName)) {
+      child.material = tvBackMaterial;
+    } else {
+      // default everything else (front, buttons, screw, AV jacks, logo) to TVfront
+      child.material = tvFrontMaterial;
+    }
+  });
+
+  if (screenMesh) {
+    screenMesh.material = new THREE.MeshBasicMaterial({
+      map: screenTexture,
+      toneMapped: false
+    });
+  } else {
+    console.warn('Could not find a mesh named "Screen" — logging node names below.');
+    model.traverse((child) => { if (child.isMesh) console.log('mesh:', child.name); });
+  }
+
+  const box = new THREE.Box3().setFromObject(model);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  model.position.sub(center);
+
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const targetSize = 40;
+  const scale = targetSize / maxDim;
+  model.scale.setScalar(scale);
+
+  tvModel = model;
+  scene.add(model);
+  registerPlaceable('TV', model, TV_POSITION, TV_ROTATION_Y);
+  makeCollidable(model);
+
+  // Hover feedback: a cloned copy of the TV, rendered with the outline
+  // shader above, toggled on/off in the mousemove handler below. outlineWidth
+  // is expressed in the model's native (pre-scale) units, same as maxDim, so
+  // it scales correctly regardless of the model's native size.
+  tvOutlineMesh = model.clone(true);
+  tvOutlineMesh.traverse((child) => {
+    if (child.isMesh) child.material = outlineMaterial;
+  });
+  outlineMaterial.uniforms.outlineWidth.value = maxDim * 0.02;
+  tvOutlineMesh.visible = false;
+  scene.add(tvOutlineMesh);
+
+  // Set up the screen glow light only now, after the model's final position
+  // and scale are applied — the light is parented to the scene (not the
+  // mesh), so it needs the mesh's finished world-space transform.
+  if (screenMesh) {
+    model.updateMatrixWorld(true);
+    setupScreenGlow(screenMesh);
+  }
+
+  savedTVCamera.height = TV_POSITION.y - 2;
+  savedTVCamera.distance = 120;
+  savedTVCamera.targetX = TV_POSITION.x;
+  savedTVCamera.targetZ = TV_POSITION.z;
+
+  document.getElementById('loading').style.display = 'none';
+}, undefined, (err) => {
+  console.error('Error loading model:', err);
+  document.getElementById('loading').textContent = 'Failed to load model — check console.';
+});
+
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+let pointerDownAt = 0, pointerDownPos = new THREE.Vector2();
+
+// You have to be reasonably close to the TV to interact with it — stops you
+// from sitting down or surfing channels from across the room.
+const TV_INTERACT_DISTANCE = 120;
+function isWithinTVRange(){
+  if (!tvModel) return false;
+  return camera.position.distanceTo(tvModel.position) <= TV_INTERACT_DISTANCE;
+}
+
+function onPointerDown(e){
+  pointerDownAt = performance.now();
+  pointerDownPos.set(e.clientX, e.clientY);
+}
+
+function raycastFromClient(x, y, target){
+  pointer.x = (x / window.innerWidth) * 2 - 1;
+  pointer.y = -(y / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  return raycaster.intersectObject(target, true);
+}
+
+function raycastFromCenter(target){
+  raycaster.setFromCamera({ x: 0, y: 0 }, camera);
+  return raycaster.intersectObject(target, true);
+}
+
+// Hover feedback for the TV outline. When the pointer isn't locked, "hover"
+// means the free mouse cursor is over the TV. Once locked (walking around
+// with mouse-look), there's no free cursor anymore — aiming is done with the
+// center crosshair — so hover instead follows whatever's under that crosshair.
+// Both paths respect TV_INTERACT_DISTANCE, so the outline doubles as a
+// "you're close enough to click this" indicator either way.
+let lastMouseX = window.innerWidth / 2, lastMouseY = window.innerHeight / 2;
+renderer.domElement.addEventListener('pointermove', (e) => {
+  lastMouseX = e.clientX;
+  lastMouseY = e.clientY;
+});
+
+function updateTVHoverOutline(){
+  if (!tvModel || !tvOutlineMesh) return;
+  if (mode !== 'freeroam'){
+    tvOutlineMesh.visible = false;
+    return;
+  }
+  const hits = document.pointerLockElement
+    ? raycastFromCenter(tvModel)
+    : raycastFromClient(lastMouseX, lastMouseY, tvModel);
+  tvOutlineMesh.visible = hits.length > 0 && isWithinTVRange();
+}
+
+function onPointerUp(e){
+  const dt = performance.now() - pointerDownAt;
+  const dx = e.clientX - pointerDownPos.x, dy = e.clientY - pointerDownPos.y;
+  if (dt > 350 || Math.hypot(dx, dy) > 6) return; // was a drag, not a click
+  if (!tvModel) return;
+  if (mode === 'transitioning') return;
+
+  if (mode === 'tv'){
+    const tvHits = raycastFromClient(e.clientX, e.clientY, tvModel);
+    if (tvHits.length === 0){
+      exitTVMode();
+      return;
+    }
+    if (screenMesh && tvHits.some(h => h.object === screenMesh)){
+      surfChannel();
+    }
+    return;
+  }
+
+  // mode === 'freeroam'
+  if (document.pointerLockElement){
+    // Already looking around — click uses the center crosshair.
+    const tvHits = raycastFromCenter(tvModel);
+    if (tvHits.length > 0 && isWithinTVRange()) enterTVMode();
+  } else {
+    // First click: check the TV under the cursor before grabbing the pointer.
+    const tvHits = raycastFromClient(e.clientX, e.clientY, tvModel);
+    if (tvHits.length > 0 && isWithinTVRange()){
+      enterTVMode();
+    } else {
+      freeRoamControls.lock();
+    }
+  }
+}
+renderer.domElement.addEventListener('pointerdown', onPointerDown);
+renderer.domElement.addEventListener('pointerup', onPointerUp);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  const delta = clock.getDelta();
+
+  drawCRTFrame();
+  drawPaddedFrame();
+  screenTexture.needsUpdate = true;
+  updateScreenGlow();
+  if (tvOutlineMesh && tvModel){
+    tvOutlineMesh.position.copy(tvModel.position);
+    tvOutlineMesh.rotation.copy(tvModel.rotation);
+    tvOutlineMesh.scale.copy(tvModel.scale);
+  }
+  updateTVHoverOutline();
+
+  if (mode === 'tv'){
+    tvControls.update();
+  } else if (mode === 'freeroam'){
+    updateFreeRoam(delta);
+    updatePlacement(delta);
+  } else if (mode === 'transitioning'){
+    updateTransition(delta);
+  }
+  lockAndReportCamera();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>
