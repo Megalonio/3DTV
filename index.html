@@ -91,7 +91,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
-import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUniformsLib.js";
 
@@ -102,11 +101,13 @@ const src = document.getElementById('srcCanvas');
 const sctx = src.getContext('2d');
 const crtCanvas = document.getElementById('crtCanvas');
 
-// No default video baked in anymore — the screen just shows static/no-signal
-// until a link is loaded via the panel (see loadStreamUrl). Once something
-// IS loaded, jump to a random point in it whenever it (re)loads, same as
-// before — except for live streams (duration is Infinity/NaN there), which
-// just play from the live edge since there's nothing to seek into.
+// No single fixed video baked in — instead, a random channel from a default
+// public IPTV list is loaded on page load (see loadDefaultChannelRandomly()
+// further down, near the rest of the stream-loading logic). Once something
+// IS loaded (default or user-supplied), jump to a random point in it
+// whenever it (re)loads, same as before — except for live streams (duration
+// is Infinity/NaN there), which just play from the live edge since there's
+// nothing to seek into.
 vid.addEventListener('loadedmetadata', () => {
   if (Number.isFinite(vid.duration) && vid.duration > 0){
     vid.currentTime = Math.random() * vid.duration;
@@ -360,13 +361,15 @@ scene.background = new THREE.Color(0x1a1a1a);
 const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
 if (isTouchDevice) document.body.classList.add('touch-device');
 
-// ---- 3D house the TV sits inside, loaded from Duplex.glb (next to index.html,
-// same as model.dae). Its embedded texture reference resolves against the
-// textures/ folder for consistency with the TV's own PBR textures.
+// ---- 3D house the TV sits inside, loaded from Duplex.glb (next to
+// index.html — everything is now just index.html + Duplex.glb + TV.glb +
+// Arcade.glb, no separate textures/ folder; all three .glb files carry
+// their own textures embedded).
 // The house's own units are almost certainly a different scale than the
-// arbitrary units the TV is normalized to (targetSize below), so it needs to
-// be scaled up/down and have its floor lined up with the TV's base —
-// otherwise it renders as either a speck or a wall filling the whole screen.
+// arbitrary units the furniture is normalized to (targetSize below), so it
+// needs to be scaled up/down and have its floor lined up with everything
+// else's base — otherwise it renders as either a speck or a wall filling
+// the whole screen.
 // HOUSE_SCALE, HOUSE_FLOOR_Y, and HOUSE_OFFSET_X/Z are guesses; tune them the
 // same way as the camera height/distance (open devtools, check the logged
 // native size, adjust, refresh), then send me the final numbers.
@@ -381,10 +384,16 @@ const HOUSE_OFFSET_Z = 0;
 // TV_POSITION is a world-space offset added AFTER the model is centered and
 // scaled, so it's independent of the model's own internal pivot.
 // TV_ROTATION_Y (radians) turns the TV to face out into the room.
-const TV_POSITION = new THREE.Vector3(-125, 17, -92);
+const TV_POSITION = new THREE.Vector3(-125, 14, -90);
 // If you rotate the TV, the TV-mode camera approach below (which assumes the
 // screen faces +Z, same as the original fixed viewer) needs updating too.
-let TV_ROTATION_Y = 0;
+let TV_ROTATION_Y = 4.71;
+
+// ---- Where the arcade cabinet sits. Same deal as TV_POSITION above — a
+// starting guess, meant to be walked up to in free-roam (press P to enter
+// placement mode, Tab to cycle to "Arcade") and nudged into its final spot.
+const ARCADE_POSITION = new THREE.Vector3(10, 15, -44);
+let ARCADE_ROTATION_Y = 1.57;
 
 // ---- Collision registry ----
 // Anything the free-roam camera should collide with (can't walk through,
@@ -420,10 +429,11 @@ function setCollidableSide(side){
 }
 
 // ---- Generic "placeable items" registry ----
-// Anything nudge-able in placement mode (TV, TV stand, and anything added
-// later) gets registered here once its model has loaded. `placement` is the
-// tunable world-space offset (what nudging changes); `basePosition` is the
-// model's own one-time centering offset and is never touched after load.
+// Anything nudge-able in placement mode (TV, arcade cabinet, and anything
+// added later) gets registered here once its model has loaded. `placement`
+// is the tunable world-space offset (what nudging changes); `basePosition`
+// is the model's own one-time centering offset and is never touched after
+// load.
 const placeableItems = [];
 
 function registerPlaceable(name, object3D, placement, rotationY){
@@ -432,7 +442,11 @@ function registerPlaceable(name, object3D, placement, rotationY){
     object: object3D,
     basePosition: object3D.position.clone(),
     placement,
-    rotationY
+    rotationY,
+    // Hidden float accumulator — lets held movement keys feel smooth while
+    // `placement` itself (what actually gets applied, and what the HUD
+    // shows) always stays snapped to whole numbers.
+    rawPlacement: placement.clone()
   };
   placeableItems.push(item);
   applyPlaceableTransform(item);
@@ -445,7 +459,6 @@ function applyPlaceableTransform(item){
 }
 
 const houseLoader = new GLTFLoader();
-houseLoader.setResourcePath('textures/');
 houseLoader.load('Duplex.glb', (gltf) => {
   const house = gltf.scene;
 
@@ -792,22 +805,31 @@ function updateXRInput(){
 // ---- Live placement mode ----
 // Press P (in free-roam) to toggle it, Tab to switch which registered item
 // you're moving (TV, TV Stand, anything added later). While it's on:
-//   I / K / J / L  — move forward / back / left / right
-//   U / O          — move up / down
-//   N / M          — rotate
+//   I / K / J / L  — move forward / back / left / right (snaps to whole
+//                    numbers — no fractional coordinates like 10.4)
+//   U / O          — move up / down (same whole-number snapping)
+//   N / M          — rotate (snaps to 1 of 8 directions, 45° apart — like
+//                    an arcade stick: 4 walls-facing + 4 corners. This keeps
+//                    "against the wall" angles exact instead of eyeballed
+//                    decimals that are close-but-not-quite-square.)
 // The HUD shows the running placement/rotation for whichever item is
 // selected — once it looks right, copy those numbers into that item's
 // constants up top.
 let placementMode = false;
 let activeItemIndex = 0;
 const PLACEMENT_MOVE_SPEED = 20;  // units / second
-const PLACEMENT_ROTATE_SPEED = 1; // radians / second
-const placementState = { fwd: false, back: false, left: false, right: false, up: false, down: false, rotL: false, rotR: false };
+const PLACEMENT_ROTATE_STEP = Math.PI / 4; // 45° per key press — 8 snap positions total
+const placementState = { fwd: false, back: false, left: false, right: false, up: false, down: false };
+
+// Snaps a rotation (radians) to the nearest 45° increment.
+function snapRotationToOctant(radians){
+  return Math.round(radians / PLACEMENT_ROTATE_STEP) * PLACEMENT_ROTATE_STEP;
+}
 
 // Deliberately NOT on WASD/arrows — those already walk the character, so
 // reusing them for placement would move you and the item at the same time.
 function onPlacementKeyDown(e){
-  if (e.code === 'KeyP'){ placementMode = !placementMode; return; }
+  if (e.code === 'KeyP'){ placementMode = !placementMode; if (placementMode) overscanAdjustMode = false; return; }
   if (!placementMode) return;
   if (e.code === 'Tab'){
     e.preventDefault();
@@ -821,8 +843,23 @@ function onPlacementKeyDown(e){
     case 'KeyL': placementState.right = true; e.preventDefault(); break;
     case 'KeyU': placementState.up = true; e.preventDefault(); break;
     case 'KeyO': placementState.down = true; e.preventDefault(); break;
-    case 'KeyN': placementState.rotL = true; break;
-    case 'KeyM': placementState.rotR = true; break;
+    case 'KeyN': {
+      // Discrete step on keydown only (not held) — one press = one snap.
+      if (placeableItems.length > 0){
+        const item = placeableItems[activeItemIndex];
+        item.rotationY = snapRotationToOctant(item.rotationY) - PLACEMENT_ROTATE_STEP;
+        applyPlaceableTransform(item);
+      }
+      break;
+    }
+    case 'KeyM': {
+      if (placeableItems.length > 0){
+        const item = placeableItems[activeItemIndex];
+        item.rotationY = snapRotationToOctant(item.rotationY) + PLACEMENT_ROTATE_STEP;
+        applyPlaceableTransform(item);
+      }
+      break;
+    }
   }
 }
 function onPlacementKeyUp(e){
@@ -833,8 +870,6 @@ function onPlacementKeyUp(e){
     case 'KeyL': placementState.right = false; break;
     case 'KeyU': placementState.up = false; break;
     case 'KeyO': placementState.down = false; break;
-    case 'KeyN': placementState.rotL = false; break;
-    case 'KeyM': placementState.rotR = false; break;
   }
 }
 document.addEventListener('keydown', onPlacementKeyDown);
@@ -844,14 +879,19 @@ function updatePlacement(delta){
   if (!placementMode || placeableItems.length === 0) return;
   const item = placeableItems[activeItemIndex];
   const step = PLACEMENT_MOVE_SPEED * delta;
-  if (placementState.fwd) item.placement.z -= step;
-  if (placementState.back) item.placement.z += step;
-  if (placementState.left) item.placement.x -= step;
-  if (placementState.right) item.placement.x += step;
-  if (placementState.up) item.placement.y += step;
-  if (placementState.down) item.placement.y -= step;
-  if (placementState.rotL) item.rotationY -= PLACEMENT_ROTATE_SPEED * delta;
-  if (placementState.rotR) item.rotationY += PLACEMENT_ROTATE_SPEED * delta;
+  if (placementState.fwd) item.rawPlacement.z -= step;
+  if (placementState.back) item.rawPlacement.z += step;
+  if (placementState.left) item.rawPlacement.x -= step;
+  if (placementState.right) item.rawPlacement.x += step;
+  if (placementState.up) item.rawPlacement.y += step;
+  if (placementState.down) item.rawPlacement.y -= step;
+  // Snap the applied placement to whole numbers — rawPlacement keeps the
+  // exact float total so held keys don't feel stuck between integers.
+  item.placement.set(
+    Math.round(item.rawPlacement.x),
+    Math.round(item.rawPlacement.y),
+    Math.round(item.rawPlacement.z)
+  );
   applyPlaceableTransform(item);
 }
 
@@ -1105,6 +1145,59 @@ streamUrlInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') loadStreamUrl(streamUrlInput.value);
 });
 
+// ---- Default channel on page load ----
+// Nobody's pasted a link yet, so grab a random channel from this public
+// IPTV list to start. Genuinely random each visit — nothing is remembered
+// between sessions, so coming back to the site can easily land on a
+// different channel. These free lists always have some dead/geo-blocked
+// entries, so we shuffle the whole channel list once and try each in that
+// order until one actually plays, rather than giving up after the first
+// failure.
+const DEFAULT_PLAYLIST_URL = 'https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8';
+
+function shuffled(arr){
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--){
+    const j = (Math.random() * (i + 1)) | 0;
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+async function loadDefaultChannelRandomly(){
+  streamStatus.textContent = 'Loading…';
+  let parsed;
+  try {
+    const res = await fetch(DEFAULT_PLAYLIST_URL);
+    const text = await res.text();
+    parsed = parseChannelList(text);
+  } catch (err){
+    console.error('Could not fetch default playlist:', err);
+    streamStatus.textContent = 'Could not load default playlist';
+    return;
+  }
+  if (!parsed || parsed.length === 0){
+    streamStatus.textContent = 'Default playlist had no channels';
+    return;
+  }
+  channelList = parsed;
+  for (const idx of shuffled(parsed.map((_, i) => i))){
+    const ch = parsed[idx];
+    streamStatus.textContent = 'Loading ' + ch.name + '…';
+    try {
+      await playMediaUrl(ch.url);
+      channelIndex = idx;
+      channelShownAt = performance.now();
+      streamStatus.textContent = 'Playing: ' + ch.name;
+      return;
+    } catch (err){
+      console.warn('Default channel failed, trying another:', ch.name, err);
+    }
+  }
+  streamStatus.textContent = 'Could not find a working channel in the default playlist';
+}
+loadDefaultChannelRandomly();
+
 // While sat at the TV, Up/Down (plus W/S, and Z since AZERTY swaps W<->Z)
 // step through a loaded channel list. Clicking the screen (surfChannel(),
 // bound elsewhere) is deliberately separate — it only re-seeks whatever's
@@ -1240,12 +1333,71 @@ function lockAndReportCamera(){
 // CRT-shader output onto a second canvas at a smaller size, offset so it's
 // inset from whichever edges are dialed in, with black filling the rest.
 // That padded canvas — not crtCanvas directly — is what becomes the texture.
+//
+// Live-adjustable: press B to toggle "overscan adjust mode" (mirrors P for
+// placement mode — the two are mutually exclusive so IJKL/UO/NM aren't
+// double-booked). While it's on:
+//   I / K  — top edge:    less / more
+//   U / O  — bottom edge: less / more
+//   J / L  — left edge:   less / more
+//   N / M  — right edge:  less / more
+// The HUD shows the running values — once it looks right, copy those
+// numbers into the `overscan` object below.
 const paddedCanvas = document.createElement('canvas');
 paddedCanvas.width = crtCanvas.width;
 paddedCanvas.height = crtCanvas.height;
 const paddedCtx = paddedCanvas.getContext('2d');
 
-const overscan = { top: 0.15, bottom: 0.15, left: 0.05, right: 0.05 };
+const overscan = { top: 0, bottom: 0.10, left: 0, right: 0.03 };
+
+let overscanAdjustMode = false;
+const OVERSCAN_ADJUST_SPEED = 0.1; // fraction of screen / second
+const OVERSCAN_MIN = 0, OVERSCAN_MAX = 0.4;
+const overscanState = { topInc: false, topDec: false, bottomInc: false, bottomDec: false, leftInc: false, leftDec: false, rightInc: false, rightDec: false };
+
+function onOverscanKeyDown(e){
+  if (e.code === 'KeyB'){ overscanAdjustMode = !overscanAdjustMode; if (overscanAdjustMode) placementMode = false; return; }
+  if (!overscanAdjustMode) return;
+  switch (e.code){
+    case 'KeyI': overscanState.topDec = true; e.preventDefault(); break;
+    case 'KeyK': overscanState.topInc = true; e.preventDefault(); break;
+    case 'KeyU': overscanState.bottomDec = true; e.preventDefault(); break;
+    case 'KeyO': overscanState.bottomInc = true; e.preventDefault(); break;
+    case 'KeyJ': overscanState.leftDec = true; e.preventDefault(); break;
+    case 'KeyL': overscanState.leftInc = true; e.preventDefault(); break;
+    case 'KeyN': overscanState.rightDec = true; break;
+    case 'KeyM': overscanState.rightInc = true; break;
+  }
+}
+function onOverscanKeyUp(e){
+  switch (e.code){
+    case 'KeyI': overscanState.topDec = false; break;
+    case 'KeyK': overscanState.topInc = false; break;
+    case 'KeyU': overscanState.bottomDec = false; break;
+    case 'KeyO': overscanState.bottomInc = false; break;
+    case 'KeyJ': overscanState.leftDec = false; break;
+    case 'KeyL': overscanState.leftInc = false; break;
+    case 'KeyN': overscanState.rightDec = false; break;
+    case 'KeyM': overscanState.rightInc = false; break;
+  }
+}
+document.addEventListener('keydown', onOverscanKeyDown);
+document.addEventListener('keyup', onOverscanKeyUp);
+
+function clampOverscan(v){ return Math.min(OVERSCAN_MAX, Math.max(OVERSCAN_MIN, v)); }
+
+function updateOverscanAdjust(delta){
+  if (!overscanAdjustMode) return;
+  const step = OVERSCAN_ADJUST_SPEED * delta;
+  if (overscanState.topDec) overscan.top = clampOverscan(overscan.top - step);
+  if (overscanState.topInc) overscan.top = clampOverscan(overscan.top + step);
+  if (overscanState.bottomDec) overscan.bottom = clampOverscan(overscan.bottom - step);
+  if (overscanState.bottomInc) overscan.bottom = clampOverscan(overscan.bottom + step);
+  if (overscanState.leftDec) overscan.left = clampOverscan(overscan.left - step);
+  if (overscanState.leftInc) overscan.left = clampOverscan(overscan.left + step);
+  if (overscanState.rightDec) overscan.right = clampOverscan(overscan.right - step);
+  if (overscanState.rightInc) overscan.right = clampOverscan(overscan.right + step);
+}
 
 function drawPaddedFrame(){
   const w = paddedCanvas.width, h = paddedCanvas.height;
@@ -1266,44 +1418,18 @@ const screenTexture = new THREE.CanvasTexture(paddedCanvas);
 screenTexture.colorSpace = THREE.SRGBColorSpace;
 screenTexture.minFilter = THREE.LinearFilter;
 screenTexture.magFilter = THREE.LinearFilter;
+// This mesh's "Screen" UVs are authored the opposite way from three.js's
+// default texture convention, so the default flipY=true was flipping the
+// whole picture vertically — subtle on symmetric shapes (the "H" in the
+// channel OSD looks the same either way), obvious on anything else (digits
+// upside-down, and the top-right-anchored OSD landing bottom-right instead).
+screenTexture.flipY = false;
 
 let screenMesh = null;
-
-// ---- PBR texture sets for TVback / TVfront, loaded from textures/ folder ----
-const texLoader = new THREE.TextureLoader();
-
-function loadTex(path, srgb){
-  const t = texLoader.load(path);
-  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
-  return t;
-}
-
-function buildPBRMaterial(prefix){
-  return new THREE.MeshStandardMaterial({
-    map:          loadTex(`textures/${prefix}_albedo.jpg`, true),
-    aoMap:        loadTex(`textures/${prefix}_AO.jpg`, false),
-    metalnessMap: loadTex(`textures/${prefix}_metallic.jpg`, false),
-    roughnessMap: loadTex(`textures/${prefix}_roughness.jpg`, false),
-    normalMap:    loadTex(`textures/${prefix}_normal.png`, false),
-    metalness: 1.0,
-    roughness: 1.0
-  });
-}
-
-const tvBackMaterial = buildPBRMaterial('TVback');
-const tvFrontMaterial = buildPBRMaterial('TVfront');
-
-// aoMap requires a second UV channel — clone uv into uv2 since these meshes
-// only have one UV set exported from the .dae
-function ensureUV2(mesh){
-  const geo = mesh.geometry;
-  if (geo && geo.attributes.uv && !geo.attributes.uv2) {
-    geo.setAttribute('uv2', geo.attributes.uv);
-  }
-}
-
 let tvModel = null;
 let tvOutlineMesh = null;
+let arcadeModel = null;
+let arcadeOutlineMesh = null;
 
 // ---- "Inverted hull" toon outline ----
 // Classic cartoon-outline trick: render a second copy of the mesh, pushed
@@ -1329,26 +1455,30 @@ const outlineMaterial = new THREE.ShaderMaterial({
   side: THREE.BackSide
 });
 
-const loader = new ColladaLoader();
-loader.load('model.dae', (collada) => {
-  const model = collada.scene;
+// Same trick, second copy — a fresh clone (not the same instance) so its
+// outlineWidth uniform can be set independently. The TV and the arcade are
+// scaled very differently (targetSize 40 vs 70), so sharing one material's
+// uniform would mean whichever model loaded last "wins" and both outlines
+// end up the wrong thickness.
+const arcadeOutlineMaterial = outlineMaterial.clone();
+
+// ---- TV, loaded from TV.glb ----
+// Self-contained now — PBR body textures, glass, and the glowing screen
+// material are all embedded in the file, so no textures/ folder is needed.
+// The screen is the mesh using material ".003" in this export: a black
+// base color plus an emissive map, which is how the "powered on" glow was
+// authored. Matched by that name first (fast path for this exact file),
+// falling back to the same black-base/emissive-map heuristic in case a
+// future re-export renames it.
+const tvLoader = new GLTFLoader();
+tvLoader.load('TV.glb', (gltf) => {
+  const model = gltf.scene;
 
   model.traverse((child) => {
-    if (!child.isMesh) return;
-
-    if (/screen/i.test(child.name)) {
-      screenMesh = child;
-      return;
-    }
-
-    ensureUV2(child);
-    const matName = (child.material && child.material.name) || '';
-    if (/back/i.test(child.name) || /back/i.test(matName)) {
-      child.material = tvBackMaterial;
-    } else {
-      // default everything else (front, buttons, screw, AV jacks, logo) to TVfront
-      child.material = tvFrontMaterial;
-    }
+    if (!child.isMesh || !child.material) return;
+    const mat = child.material;
+    const looksLikeScreen = mat.name === '.003' || (mat.emissiveMap && !mat.map);
+    if (looksLikeScreen) screenMesh = child;
   });
 
   if (screenMesh) {
@@ -1357,8 +1487,8 @@ loader.load('model.dae', (collada) => {
       toneMapped: false
     });
   } else {
-    console.warn('Could not find a mesh named "Screen" — logging node names below.');
-    model.traverse((child) => { if (child.isMesh) console.log('mesh:', child.name); });
+    console.warn('Could not find the TV screen mesh — logging meshes/materials below.');
+    model.traverse((child) => { if (child.isMesh) console.log('mesh:', child.name, 'material:', child.material && child.material.name); });
   }
 
   const box = new THREE.Box3().setFromObject(model);
@@ -1366,7 +1496,18 @@ loader.load('model.dae', (collada) => {
   box.getSize(size);
   const center = new THREE.Vector3();
   box.getCenter(center);
-  model.position.sub(center);
+  // Centering fix: this glTF export bakes a real offset into its mesh
+  // nodes (one piece sits ~2 units off in Z, for example), so the model's
+  // true visual center is nowhere near its own local origin. Previously we
+  // shifted model.position by -center, but rotation is applied to a
+  // node's children in *local* space before that position offset — so the
+  // TV was rotating around its untouched, off-center local origin, not
+  // its visual center (hence the "orbiting around something invisible").
+  // Fix: shift each top-level child by -center instead, so the geometry
+  // itself ends up centered on the model's local origin. Now model.rotation
+  // (set below via registerPlaceable) pivots around the true center, and
+  // model.position is free to be used purely for placement.
+  model.children.forEach((child) => child.position.sub(center));
 
   const maxDim = Math.max(size.x, size.y, size.z);
   const targetSize = 40;
@@ -1398,15 +1539,55 @@ loader.load('model.dae', (collada) => {
     setupScreenGlow(screenMesh);
   }
 
-  savedTVCamera.height = 17;
-  savedTVCamera.distance = 120;
+  savedTVCamera.height = 17.5;
+  savedTVCamera.distance = 55;
   savedTVCamera.targetX = TV_POSITION.x;
   savedTVCamera.targetZ = TV_POSITION.z;
 
   document.getElementById('loading').style.display = 'none';
 }, undefined, (err) => {
-  console.error('Error loading model:', err);
-  document.getElementById('loading').textContent = 'Failed to load model — check console.';
+  console.error('Error loading TV.glb:', err);
+  document.getElementById('loading').textContent = 'Failed to load TV model — check console.';
+});
+
+// ---- Arcade cabinet, loaded from Arcade.glb ----
+// A static, self-contained decorative piece — same centering/scaling
+// treatment as the TV, registered as both collidable (can't walk through
+// it) and placeable (nudge-able with P same as the TV). No click-to-sit or
+// screen texture — it's just furniture for now.
+const ARCADE_TARGET_SIZE = 70; // a guess at a sensible cabinet height relative to the TV's 40; nudge/rescale once you see it in place
+const arcadeLoader = new GLTFLoader();
+arcadeLoader.load('Arcade.glb', (gltf) => {
+  const model = gltf.scene;
+
+  const box = new THREE.Box3().setFromObject(model);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  model.position.sub(center);
+
+  const maxDim = Math.max(size.x, size.y, size.z);
+  model.scale.setScalar(ARCADE_TARGET_SIZE / maxDim);
+
+  scene.add(model);
+  registerPlaceable('Arcade', model, ARCADE_POSITION, ARCADE_ROTATION_Y);
+  makeCollidable(model);
+
+  arcadeModel = model;
+
+  // Hover feedback, same "inverted hull" trick as the TV: a cloned copy
+  // rendered with the outline shader, toggled on/off based on where the
+  // cursor/crosshair is pointing.
+  arcadeOutlineMesh = model.clone(true);
+  arcadeOutlineMesh.traverse((child) => {
+    if (child.isMesh) child.material = arcadeOutlineMaterial;
+  });
+  arcadeOutlineMaterial.uniforms.outlineWidth.value = maxDim * 0.02;
+  arcadeOutlineMesh.visible = false;
+  scene.add(arcadeOutlineMesh);
+}, undefined, (err) => {
+  console.error('Error loading Arcade.glb:', err);
 });
 
 const raycaster = new THREE.Raycaster();
@@ -1462,6 +1643,21 @@ function updateTVHoverOutline(){
   tvOutlineMesh.visible = hits.length > 0 && isWithinTVRange();
 }
 
+// Same idea for the arcade cabinet — it's just decorative furniture (no
+// click action, no distance gating like the TV's), so hovering it just
+// highlights it, with no range check needed.
+function updateArcadeHoverOutline(){
+  if (!arcadeModel || !arcadeOutlineMesh) return;
+  if (mode !== 'freeroam'){
+    arcadeOutlineMesh.visible = false;
+    return;
+  }
+  const hits = document.pointerLockElement
+    ? raycastFromCenter(arcadeModel)
+    : raycastFromClient(lastMouseX, lastMouseY, arcadeModel);
+  arcadeOutlineMesh.visible = hits.length > 0;
+}
+
 function onPointerUp(e){
   const dt = performance.now() - pointerDownAt;
   const dx = e.clientX - pointerDownPos.x, dy = e.clientY - pointerDownPos.y;
@@ -1509,6 +1705,7 @@ function animate() {
   const delta = clock.getDelta();
 
   drawCRTFrame();
+  updateOverscanAdjust(delta);
   drawPaddedFrame();
   screenTexture.needsUpdate = true;
   updateScreenGlow();
@@ -1518,6 +1715,12 @@ function animate() {
     tvOutlineMesh.scale.copy(tvModel.scale);
   }
   updateTVHoverOutline();
+  if (arcadeOutlineMesh && arcadeModel){
+    arcadeOutlineMesh.position.copy(arcadeModel.position);
+    arcadeOutlineMesh.rotation.copy(arcadeModel.rotation);
+    arcadeOutlineMesh.scale.copy(arcadeModel.scale);
+  }
+  updateArcadeHoverOutline();
 
   if (mode === 'tv'){
     tvControls.update();
@@ -1528,6 +1731,14 @@ function animate() {
     updateTransition(delta);
   }
   lockAndReportCamera();
+  if (overscanAdjustMode){
+    let text = `--- Overscan adjust (B to toggle) ---`;
+    text += `\ntop: ${overscan.top.toFixed(2)}   bottom: ${overscan.bottom.toFixed(2)}`;
+    text += `\nleft: ${overscan.left.toFixed(2)}   right: ${overscan.right.toFixed(2)}`;
+    text += `\nI/K: top -/+   U/O: bottom -/+   J/L: left -/+   N/M: right -/+`;
+    camHud.style.display = '';
+    camHud.textContent = text;
+  }
   renderer.render(scene, camera);
 }
 renderer.setAnimationLoop(animate);
