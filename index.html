@@ -10,22 +10,13 @@
 <style>
   html, body { margin:0; height:100%; overflow:hidden; background:#111; }
   #container { position:absolute; inset:0; }
-  #hint {
-    position:absolute; bottom:16px; left:50%; transform:translateX(-50%);
-    color:#ddd; font-family:sans-serif; font-size:13px; opacity:0.7;
-    pointer-events:none; text-align:center;
-  }
   #loading {
     position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
     color:#fff; font-family:sans-serif; font-size:16px; background:#111; z-index:10;
   }
-  #unmute {
-    position:absolute; top:16px; right:16px; z-index:5;
-    background:rgba(0,0,0,0.5); color:#fff; border:1px solid #666;
-    padding:8px 14px; border-radius:6px; font-family:sans-serif; font-size:13px;
-    cursor:pointer;
-  }
   #srcCanvas, #crtCanvas { display:none; }
+  /* VRButton (injected by three.js) isn't used — always hidden. */
+  #VRButton { display:none !important; }
   #streamPanel {
     position:absolute; top:50%; right:4%; transform:translateY(-50%);
     z-index:6; width:230px; font-family:sans-serif; color:#eee;
@@ -62,18 +53,13 @@
     left:50%; top:50%; transform:translate(-50%,-50%);
     touch-action:none;
   }
-  /* Nudge the browser's WebXR "ENTER VR" button up a bit on touch devices
-     so it doesn't sit flush against the joystick / home-indicator area. */
-  body.touch-device #VRButton { bottom:24px !important; }
 </style>
 </head>
 
 <body>
 <div id="container"></div>
 <div id="loading">Loading model…</div>
-<div id="hint">WASD to walk &middot; Click to look around &middot; Click the TV to sit down &middot; P to nudge placement</div>
 <div id="crosshair" style="position:absolute;top:50%;left:50%;width:6px;height:6px;margin:-3px 0 0 -3px;border-radius:50%;background:rgba(255,255,255,0.8);pointer-events:none;z-index:5;"></div>
-<button id="unmute">🔇 Unmute</button>
 
 <div id="joystickZone">
   <div id="joystickBase">
@@ -90,7 +76,7 @@
 
 <canvas id="srcCanvas" width="256" height="240"></canvas>
 <canvas id="crtCanvas" width="512" height="480"></canvas>
-<video id="vid" style="display:none" muted playsinline loop crossorigin="anonymous"></video>
+<video id="vid" style="display:none" playsinline loop crossorigin="anonymous"></video>
 
 <script type="importmap">
 {
@@ -108,7 +94,6 @@ import { PointerLockControls } from "three/addons/controls/PointerLockControls.j
 import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUniformsLib.js";
-import { VRButton } from "three/addons/webxr/VRButton.js";
 
 /* ---- PART 1: original CRT pipeline (video -> NES-res canvas -> WebGL shader) ---- */
 
@@ -333,11 +318,6 @@ function drawCRTFrame(){
 
 requestAnimationFrame(captureLoop);
 
-document.getElementById('unmute').addEventListener('click', (e) => {
-  vid.muted = !vid.muted;
-  e.target.textContent = vid.muted ? "🔇 Unmute" : "🔊 Mute";
-});
-
 /* ---- PART 2: Three.js scene, CRT canvas mapped onto the 3D "Screen" mesh ---- */
 
 RectAreaLightUniformsLib.init();
@@ -456,10 +436,10 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 container.appendChild(renderer.domElement);
 
 // ---- WebXR (VR headset support) ----
-// VRButton.createButton() quietly renders an "VR NOT SUPPORTED" disabled
-// button on devices/browsers without WebXR, so it's always safe to add.
+// Kept enabled on the renderer in case a controller ever drives this, but
+// the on-screen "ENTER VR"/"VR NOT SUPPORTED" button is skipped — it's not
+// needed and was just clutter on unsupported (i.e. most) devices.
 renderer.xr.enabled = true;
-document.body.appendChild(VRButton.createButton(renderer));
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.6));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
@@ -704,7 +684,7 @@ function syncTouchLookAngles(){
 function onTouchLookStart(e){
   if (mode !== 'freeroam' || renderer.xr.isPresenting) return;
   const target = e.target;
-  if (target.closest && target.closest('#joystickZone, #streamPanel, #unmute')) return;
+  if (target.closest && target.closest('#joystickZone, #streamPanel')) return;
   const t = e.changedTouches[0];
   touchLookId = t.identifier;
   touchLookLastX = t.clientX;
@@ -920,14 +900,10 @@ function updateFreeRoam(delta){
 
 const camHud = document.createElement('div');
 camHud.id = 'camHud';
-camHud.style.cssText = 'position:absolute;bottom:16px;left:16px;z-index:5;color:#9f9;font-family:monospace;font-size:12px;background:rgba(0,0,0,0.5);padding:6px 10px;border-radius:6px;pointer-events:none;white-space:pre;';
+camHud.style.cssText = 'position:absolute;bottom:16px;left:16px;z-index:5;color:#9f9;font-family:monospace;font-size:12px;background:rgba(0,0,0,0.5);padding:6px 10px;border-radius:6px;pointer-events:none;white-space:pre;display:none;';
 document.body.appendChild(camHud);
 
 const crosshairEl = document.getElementById('crosshair');
-const hintEl = document.getElementById('hint');
-if (isTouchDevice){
-  hintEl.textContent = 'Joystick to walk · Drag to look around · Tap the TV to sit down';
-}
 const streamPanel = document.getElementById('streamPanel');
 const streamUrlInput = document.getElementById('streamUrlInput');
 const streamStatus = document.getElementById('streamStatus');
@@ -1015,7 +991,6 @@ function startTransition(toPos, toQuat, finalMode){
   tvControls.enabled = false;
   if (document.pointerLockElement) freeRoamControls.unlock();
   crosshairEl.style.display = 'none';
-  hintEl.textContent = '';
   streamPanel.style.display = 'none';
 }
 
@@ -1033,14 +1008,10 @@ function finishTransition(){
     tvControls.target.set(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ);
     tvControls.enabled = true;
     tvControls.update();
-    hintEl.textContent = 'Drag to adjust height · Scroll to zoom · Click the screen to surf channels · Paste a link on the right to play it · Click away to get up';
     streamPanel.style.display = 'block';
   } else {
     mode = 'freeroam';
     crosshairEl.style.display = '';
-    hintEl.textContent = isTouchDevice
-      ? 'Joystick to walk · Drag to look around · Tap the TV to sit down'
-      : 'WASD to walk · Click to look around · Click the TV to sit down · P to nudge placement';
   }
   pendingMode = null;
 }
@@ -1079,21 +1050,31 @@ function lockAndReportCamera(){
     savedTVCamera.height = camera.position.y;
     savedTVCamera.distance = camera.position.distanceTo(tvControls.target);
 
-    const height = camera.position.y.toFixed(2);
-    const distance = camera.position.distanceTo(tvControls.target).toFixed(2);
-    camHud.textContent = `camera height: ${height}\ncamera distance: ${distance}`;
+    if (placementMode){
+      const height = camera.position.y.toFixed(2);
+      const distance = camera.position.distanceTo(tvControls.target).toFixed(2);
+      camHud.style.display = '';
+      camHud.textContent = `camera height: ${height}\ncamera distance: ${distance}`;
+    } else {
+      camHud.style.display = 'none';
+    }
   } else if (mode === 'freeroam') {
-    const p = camera.position;
-    let text = `x: ${p.x.toFixed(1)}  y: ${p.y.toFixed(1)}  z: ${p.z.toFixed(1)}`;
+    // Coords/placement HUD is debug info — kept hidden unless placement
+    // mode is on (press P), so it doesn't clutter normal viewing.
     if (placementMode && placeableItems.length > 0){
+      const p = camera.position;
       const item = placeableItems[activeItemIndex];
+      let text = `x: ${p.x.toFixed(1)}  y: ${p.y.toFixed(1)}  z: ${p.z.toFixed(1)}`;
       text += `\n--- Placement (P to toggle, Tab to switch item) ---`;
       text += `\nEditing: ${item.name} (${activeItemIndex + 1}/${placeableItems.length})`;
       text += `\nposition: (${item.placement.x.toFixed(1)}, ${item.placement.y.toFixed(1)}, ${item.placement.z.toFixed(1)})`;
       text += `\nrotationY: ${item.rotationY.toFixed(2)}`;
       text += `\nIJKL: move · U/O: height · N/M: rotate · Tab: switch item`;
+      camHud.style.display = '';
+      camHud.textContent = text;
+    } else {
+      camHud.style.display = 'none';
     }
-    camHud.textContent = text;
   }
   // mode === 'transitioning': leave the HUD as it was, nothing to report mid-flight
 }
@@ -1261,7 +1242,7 @@ loader.load('model.dae', (collada) => {
     setupScreenGlow(screenMesh);
   }
 
-  savedTVCamera.height = TV_POSITION.y - 2;
+  savedTVCamera.height = 17;
   savedTVCamera.distance = 120;
   savedTVCamera.targetX = TV_POSITION.x;
   savedTVCamera.targetZ = TV_POSITION.z;
