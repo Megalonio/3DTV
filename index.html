@@ -355,6 +355,11 @@ const container = document.getElementById('container');
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x1a1a1a);
 
+// Detected early (moved up from the touch-controls section below) so the
+// renderer can pick mobile-friendly settings from the start.
+const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+if (isTouchDevice) document.body.classList.add('touch-device');
+
 // ---- 3D house the TV sits inside, loaded from Duplex.glb (next to index.html,
 // same as model.dae). Its embedded texture reference resolves against the
 // textures/ folder for consistency with the TV's own PBR textures.
@@ -387,19 +392,31 @@ let TV_ROTATION_Y = 0;
 // applyFloorSnap() further down.
 const collidables = [];
 
+// Flat cache of every material belonging to a collidable mesh, so the two
+// functions below can flip .side for the instant of a raycast without a
+// full scene traverse every frame.
+const collidableMaterials = [];
+
 // Imported architectural meshes (like the house) are often modeled to be
-// seen only from inside a room, with normals/winding facing that way — which
-// means a collision raycast approaching a wall from "outside" can miss it
-// entirely (the raycaster culls backfaces the same way rendering does).
-// Forcing DoubleSide here fixes that for collision purposes and is harmless
-// visually for solid walls/furniture.
+// seen only from inside a room, with normals/winding facing that way —
+// which means a collision raycast approaching a wall from "outside" can
+// miss it entirely (the raycaster culls backfaces the same way rendering
+// does). Rather than permanently rendering these materials double-sided
+// (which roughly doubles fragment/overdraw cost for the whole house —
+// a real cost on mobile GPUs), setCollidableSide() below flips them to
+// DoubleSide only for the duration of each raycast call, then straight
+// back to FrontSide for the actual frame render.
 function makeCollidable(object3D){
   object3D.traverse((child) => {
     if (!child.isMesh || !child.material) return;
-    if (Array.isArray(child.material)) child.material.forEach(m => { m.side = THREE.DoubleSide; });
-    else child.material.side = THREE.DoubleSide;
+    const mats = Array.isArray(child.material) ? child.material : [child.material];
+    mats.forEach(m => collidableMaterials.push(m));
   });
   collidables.push(object3D);
+}
+
+function setCollidableSide(side){
+  for (let i = 0; i < collidableMaterials.length; i++) collidableMaterials[i].side = side;
 }
 
 // ---- Generic "placeable items" registry ----
@@ -458,8 +475,12 @@ houseLoader.load('Duplex.glb', (gltf) => {
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
 camera.position.set(0, -2, 60);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+// Antialiasing (MSAA) and a high device pixel ratio are both expensive for
+// mobile GPUs — each extra pixel-ratio step roughly squares the fragment
+// work, and MSAA multiplies it again on top. Phones fall back to no AA and
+// a lower pixel-ratio cap; desktop keeps the crisper defaults.
+const renderer = new THREE.WebGLRenderer({ antialias: !isTouchDevice });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, isTouchDevice ? 1.5 : 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 container.appendChild(renderer.domElement);
@@ -648,9 +669,6 @@ document.addEventListener('keyup', onKeyUp);
 //  - dragging anywhere else on screen looks around, since PointerLockControls
 //    (mouse-lock) doesn't work with touch — we drive the camera quaternion
 //    directly instead.
-const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
-if (isTouchDevice) document.body.classList.add('touch-device');
-
 const joyVector = { x: 0, y: 0 }; // x: strafe -1..1, y: forward(-1)/back(+1)
 
 (function setupJoystick(){
@@ -860,7 +878,9 @@ function tryMove(deltaVec){
   const dir = deltaVec.clone().divideScalar(dist);
   collisionRay.set(camera.position, dir);
   collisionRay.far = dist + COLLIDER_SKIN;
+  setCollidableSide(THREE.DoubleSide);
   const hits = collisionRay.intersectObjects(collidables, true);
+  setCollidableSide(THREE.FrontSide);
   if (hits.length > 0 && hits[0].distance < dist + COLLIDER_SKIN){
     // Wall ahead — slide along it instead of just stopping dead.
     let normal = dir.clone().negate();
@@ -883,7 +903,9 @@ function applyFloorSnap(delta){
     new THREE.Vector3(0, -1, 0)
   );
   collisionRay.far = 500;
+  setCollidableSide(THREE.DoubleSide);
   const hits = collisionRay.intersectObjects(collidables, true);
+  setCollidableSide(THREE.FrontSide);
   if (hits.length === 0) return; // no floor detected under us — leave height alone
   const targetY = hits[0].point.y + EYE_HEIGHT;
   const rise = targetY - camera.position.y;
