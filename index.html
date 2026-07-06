@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>3D TV Viewer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -44,6 +45,26 @@
   }
   #streamPanel button:hover { background:#333; }
   #streamStatus { margin-top:7px; font-size:11px; opacity:0.75; min-height:14px; }
+
+  /* ---- Mobile on-screen joystick (movement) ---- */
+  #joystickZone {
+    position:absolute; left:20px; bottom:20px; width:130px; height:130px;
+    z-index:7; display:none; touch-action:none;
+  }
+  body.touch-device #joystickZone { display:block; }
+  #joystickBase {
+    position:absolute; inset:0; border-radius:50%;
+    background:rgba(255,255,255,0.08); border:2px solid rgba(255,255,255,0.28);
+  }
+  #joystickStick {
+    position:absolute; width:56px; height:56px; border-radius:50%;
+    background:rgba(255,255,255,0.35); border:2px solid rgba(255,255,255,0.55);
+    left:50%; top:50%; transform:translate(-50%,-50%);
+    touch-action:none;
+  }
+  /* Nudge the browser's WebXR "ENTER VR" button up a bit on touch devices
+     so it doesn't sit flush against the joystick / home-indicator area. */
+  body.touch-device #VRButton { bottom:24px !important; }
 </style>
 </head>
 
@@ -53,6 +74,12 @@
 <div id="hint">WASD to walk &middot; Click to look around &middot; Click the TV to sit down &middot; P to nudge placement</div>
 <div id="crosshair" style="position:absolute;top:50%;left:50%;width:6px;height:6px;margin:-3px 0 0 -3px;border-radius:50%;background:rgba(255,255,255,0.8);pointer-events:none;z-index:5;"></div>
 <button id="unmute">🔇 Unmute</button>
+
+<div id="joystickZone">
+  <div id="joystickBase">
+    <div id="joystickStick"></div>
+  </div>
+</div>
 
 <div id="streamPanel">
   <label for="streamUrlInput">Play a link on the TV — .m3u/.m3u8 stream or a direct .mp4</label>
@@ -81,6 +108,7 @@ import { PointerLockControls } from "three/addons/controls/PointerLockControls.j
 import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUniformsLib.js";
+import { VRButton } from "three/addons/webxr/VRButton.js";
 
 /* ---- PART 1: original CRT pipeline (video -> NES-res canvas -> WebGL shader) ---- */
 
@@ -427,6 +455,12 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 container.appendChild(renderer.domElement);
 
+// ---- WebXR (VR headset support) ----
+// VRButton.createButton() quietly renders an "VR NOT SUPPORTED" disabled
+// button on devices/browsers without WebXR, so it's always safe to add.
+renderer.xr.enabled = true;
+document.body.appendChild(VRButton.createButton(renderer));
+
 scene.add(new THREE.AmbientLight(0xffffff, 0.6));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
 keyLight.position.set(5, 8, 10);
@@ -598,6 +632,136 @@ function onKeyUp(e){
 document.addEventListener('keydown', onKeyDown);
 document.addEventListener('keyup', onKeyUp);
 
+// ---- Mobile / touch controls ----
+// Two independent touch surfaces, mirroring a typical mobile FPS layout:
+//  - a virtual joystick (bottom-left) drives forward/back/strafe, feeding
+//    into the same movement pipeline as WASD via `joyVector`.
+//  - dragging anywhere else on screen looks around, since PointerLockControls
+//    (mouse-lock) doesn't work with touch — we drive the camera quaternion
+//    directly instead.
+const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+if (isTouchDevice) document.body.classList.add('touch-device');
+
+const joyVector = { x: 0, y: 0 }; // x: strafe -1..1, y: forward(-1)/back(+1)
+
+(function setupJoystick(){
+  const zone = document.getElementById('joystickZone');
+  const stick = document.getElementById('joystickStick');
+  if (!zone || !stick) return;
+  const maxRadius = 45;
+  let touchId = null, centerX = 0, centerY = 0;
+
+  function start(e){
+    if (touchId !== null) return;
+    const t = e.changedTouches[0];
+    touchId = t.identifier;
+    const rect = zone.getBoundingClientRect();
+    centerX = rect.left + rect.width / 2;
+    centerY = rect.top + rect.height / 2;
+    e.preventDefault();
+  }
+  function move(e){
+    for (const t of e.changedTouches){
+      if (t.identifier !== touchId) continue;
+      let dx = t.clientX - centerX, dy = t.clientY - centerY;
+      const dist = Math.hypot(dx, dy);
+      if (dist > maxRadius){ dx = dx / dist * maxRadius; dy = dy / dist * maxRadius; }
+      stick.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+      joyVector.x = dx / maxRadius;
+      joyVector.y = dy / maxRadius;
+      e.preventDefault();
+    }
+  }
+  function end(e){
+    for (const t of e.changedTouches){
+      if (t.identifier !== touchId) continue;
+      touchId = null;
+      joyVector.x = 0; joyVector.y = 0;
+      stick.style.transform = 'translate(-50%,-50%)';
+    }
+  }
+  zone.addEventListener('touchstart', start, { passive:false });
+  zone.addEventListener('touchmove', move, { passive:false });
+  zone.addEventListener('touchend', end, { passive:false });
+  zone.addEventListener('touchcancel', end, { passive:false });
+})();
+
+// Touch-look: drag anywhere outside the joystick/UI to rotate the camera,
+// tracked as our own yaw/pitch (same YXZ euler order PointerLockControls
+// uses) rather than relying on pointer lock, which mobile browsers don't
+// support the way desktop does.
+let touchLookId = null, touchLookLastX = 0, touchLookLastY = 0;
+let touchYaw = 0, touchPitch = 0;
+const TOUCH_LOOK_SENSITIVITY = 0.0028;
+
+function syncTouchLookAngles(){
+  const euler = new THREE.Euler(0, 0, 0, 'YXZ');
+  euler.setFromQuaternion(camera.quaternion);
+  touchYaw = euler.y;
+  touchPitch = euler.x;
+}
+
+function onTouchLookStart(e){
+  if (mode !== 'freeroam' || renderer.xr.isPresenting) return;
+  const target = e.target;
+  if (target.closest && target.closest('#joystickZone, #streamPanel, #unmute')) return;
+  const t = e.changedTouches[0];
+  touchLookId = t.identifier;
+  touchLookLastX = t.clientX;
+  touchLookLastY = t.clientY;
+  syncTouchLookAngles();
+}
+function onTouchLookMove(e){
+  if (touchLookId === null) return;
+  for (const t of e.changedTouches){
+    if (t.identifier !== touchLookId) continue;
+    const dx = t.clientX - touchLookLastX, dy = t.clientY - touchLookLastY;
+    touchLookLastX = t.clientX;
+    touchLookLastY = t.clientY;
+    touchYaw -= dx * TOUCH_LOOK_SENSITIVITY;
+    touchPitch -= dy * TOUCH_LOOK_SENSITIVITY;
+    touchPitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, touchPitch));
+    camera.quaternion.setFromEuler(new THREE.Euler(touchPitch, touchYaw, 0, 'YXZ'));
+    e.preventDefault();
+  }
+}
+function onTouchLookEnd(e){
+  for (const t of e.changedTouches){
+    if (t.identifier === touchLookId) touchLookId = null;
+  }
+}
+document.addEventListener('touchstart', onTouchLookStart, { passive:true });
+document.addEventListener('touchmove', onTouchLookMove, { passive:false });
+document.addEventListener('touchend', onTouchLookEnd, { passive:true });
+document.addEventListener('touchcancel', onTouchLookEnd, { passive:true });
+
+// ---- VR controller thumbstick movement ----
+// While an immersive session is active, poll each controller's gamepad for
+// a thumbstick axis pair and feed it into the same joyVector the on-screen
+// joystick uses, so movement code only has to live in one place.
+function updateXRInput(){
+  const session = renderer.xr.getSession && renderer.xr.getSession();
+  if (!session) return;
+  let ax = 0, ay = 0;
+  for (const source of session.inputSources){
+    const gp = source.gamepad;
+    if (!gp || !gp.axes) continue;
+    // Most XR controllers report the thumbstick as axes[2]/axes[3]
+    // (axes[0]/[1] are often an unused touchpad); fall back if only two axes exist.
+    const [gx, gy] = gp.axes.length >= 4 ? [gp.axes[2], gp.axes[3]] : [gp.axes[0] || 0, gp.axes[1] || 0];
+    if (Math.hypot(gx, gy) > Math.hypot(ax, ay)){ ax = gx; ay = gy; }
+  }
+  if (Math.hypot(ax, ay) > 0.15){
+    joyVector.x = ax;
+    joyVector.y = ay;
+  } else if (!renderer.xr.isPresenting){
+    // no-op; touch joystick owns joyVector when not in XR
+  } else {
+    joyVector.x = 0;
+    joyVector.y = 0;
+  }
+}
+
 // ---- Live placement mode ----
 // Press P (in free-roam) to toggle it, Tab to switch which registered item
 // you're moving (TV, TV Stand, anything added later). While it's on:
@@ -726,10 +890,18 @@ function updateFreeRoam(delta){
   const step = WALK_SPEED * delta;
   const startPos = camera.position.clone();
 
-  if (moveState.forward) freeRoamControls.moveForward(step);
-  if (moveState.back) freeRoamControls.moveForward(-step);
-  if (moveState.right) freeRoamControls.moveRight(step);
-  if (moveState.left) freeRoamControls.moveRight(-step);
+  updateXRInput();
+
+  // Keyboard gives discrete -1/0/1 input; the joystick/XR thumbstick gives a
+  // continuous -1..1 value. They're simply summed and clamped so either
+  // input source (or both at once) works.
+  const kbForward = (moveState.forward ? 1 : 0) - (moveState.back ? 1 : 0);
+  const kbRight = (moveState.right ? 1 : 0) - (moveState.left ? 1 : 0);
+  const moveForward = Math.max(-1, Math.min(1, kbForward - joyVector.y));
+  const moveRight = Math.max(-1, Math.min(1, kbRight + joyVector.x));
+
+  if (moveForward !== 0) freeRoamControls.moveForward(moveForward * step);
+  if (moveRight !== 0) freeRoamControls.moveRight(moveRight * step);
 
   const horizontalDelta = camera.position.clone().sub(startPos);
   camera.position.copy(startPos);
@@ -753,6 +925,9 @@ document.body.appendChild(camHud);
 
 const crosshairEl = document.getElementById('crosshair');
 const hintEl = document.getElementById('hint');
+if (isTouchDevice){
+  hintEl.textContent = 'Joystick to walk · Drag to look around · Tap the TV to sit down';
+}
 const streamPanel = document.getElementById('streamPanel');
 const streamUrlInput = document.getElementById('streamUrlInput');
 const streamStatus = document.getElementById('streamStatus');
@@ -863,7 +1038,9 @@ function finishTransition(){
   } else {
     mode = 'freeroam';
     crosshairEl.style.display = '';
-    hintEl.textContent = 'WASD to walk · Click to look around · Click the TV to sit down · P to nudge placement';
+    hintEl.textContent = isTouchDevice
+      ? 'Joystick to walk · Drag to look around · Tap the TV to sit down'
+      : 'WASD to walk · Click to look around · Click the TV to sit down · P to nudge placement';
   }
   pendingMode = null;
 }
@@ -1192,7 +1369,6 @@ window.addEventListener('resize', () => {
 });
 
 function animate() {
-  requestAnimationFrame(animate);
   const delta = clock.getDelta();
 
   drawCRTFrame();
@@ -1217,7 +1393,7 @@ function animate() {
   lockAndReportCamera();
   renderer.render(scene, camera);
 }
-animate();
+renderer.setAnimationLoop(animate);
 </script>
 </body>
 </html>
