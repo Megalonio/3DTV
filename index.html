@@ -8,15 +8,25 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
 <style>
-  html, body { margin:0; height:100%; overflow:hidden; background:#111; }
+  html, body { margin:0; height:100%; overflow:hidden; background:#0a0e14; }
   #container { position:absolute; inset:0; }
+  #techGrid {
+    position:absolute; inset:-100%; z-index:0;
+    background-image:
+      linear-gradient(rgba(47,224,255,0.18) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(47,224,255,0.18) 1px, transparent 1px);
+    background-size: 48px 48px;
+    animation: techGridScroll 12s linear infinite;
+  }
+  @keyframes techGridScroll {
+    from { transform: translate(0, 0); }
+    to   { transform: translate(48px, 48px); }
+  }
   #loading {
     position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
     color:#fff; font-family:sans-serif; font-size:16px; background:#111; z-index:10;
   }
   #srcCanvas, #crtCanvas { display:none; }
-  /* VRButton (injected by three.js) isn't used — always hidden. */
-  #VRButton { display:none !important; }
   #streamPanel {
     position:absolute; top:50%; right:4%; transform:translateY(-50%);
     z-index:6; width:230px; font-family:sans-serif; color:#eee;
@@ -60,6 +70,7 @@
 </head>
 
 <body>
+<div id="techGrid"></div>
 <div id="container"></div>
 <div id="loading">Loading model…</div>
 
@@ -98,23 +109,13 @@ import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUnifo
 
 /* ---- PART 1: original CRT pipeline (video -> NES-res canvas -> WebGL shader) ---- */
 
-// Detected up front, before any model loads, so it can gate which assets
-// even get fetched (the house never needs to load at all on Android — see
-// the Room.glb loader below) as well as the camera/exit behavior further
-// down (see the "Android: TV-only mode" block).
-const ANDROID_TV_LOCKED = /Android/i.test(navigator.userAgent);
-
 const vid = document.getElementById('vid');
 const src = document.getElementById('srcCanvas');
 const sctx = src.getContext('2d');
 const crtCanvas = document.getElementById('crtCanvas');
 
-// No single fixed video baked in, and nothing loads automatically either —
-// the TV just sits there dark/off until a link is pasted into the stream
-// panel (see loadStreamUrl() further down). Once something IS loaded, jump
-// to a random point in it whenever it (re)loads, same as before — except
-// for live streams (duration is Infinity/NaN there), which just play from
-// the live edge since there's nothing to seek into.
+// TV starts off; loads only once a link is pasted in (see loadStreamUrl).
+// Jumps to a random point on load, except live streams (no duration to seek into).
 vid.addEventListener('loadedmetadata', () => {
   if (Number.isFinite(vid.duration) && vid.duration > 0){
     vid.currentTime = Math.random() * vid.duration;
@@ -122,18 +123,9 @@ vid.addEventListener('loadedmetadata', () => {
   vid.play().catch(()=>{});
 });
 
-// Channel surfing: click the screen while sitting at the TV to "flip" to a
-// fake channel number, with a brief static burst and a random seek into
-// whatever's currently loaded (nothing to seek into until a link is loaded,
-// in which case it's just a no-signal flicker — that's expected).
-//
-// If the pasted link turns out to be an IPTV-style channel *list* (a .m3u/
-// .m3u8 file whose job is just to enumerate many other stream URLs, one per
-// channel — see parseChannelList() below) rather than a single video, that
-// list is kept in `channelList` and Up/Down (while sat at the TV) step
-// through it via changeChannelBy(). Clicking the screen never touches
-// `channelList`/`channelIndex` — it only re-seeks whatever is currently
-// loaded, same as before.
+// Channel surfing: click the screen to "flip" channel with a static burst +
+// random seek. If a .m3u/.m3u8 channel list loaded, Up/Down step through it
+// via changeChannelBy() instead (channelList/channelIndex, see parseChannelList()).
 let channelNum = 2 + (Math.random() * 82 | 0);
 let channelShownAt = performance.now();
 let staticUntil = 0;
@@ -186,8 +178,7 @@ function drawChannelOSD(){
   sctx.fillStyle = '#33ff33';
   sctx.fillText(txt, x, y);
 
-  // Channel name, smaller, under the number — only when tuned into a real
-  // multi-channel list (a fake surf number has no name to show).
+  // Channel name under the number, only for a real multi-channel list.
   if (channelList && channelList[channelIndex]){
     const name = channelList[channelIndex].name;
     sctx.font = '16px "VT323", "Courier New", monospace';
@@ -346,14 +337,9 @@ function drawCRTFrame(){
   try {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
   } catch (err){
-    // Some hosts (proxied or not) let the video actually play but still
-    // leave it CORS-tainted for pixel access — that only ever shows up here,
-    // at the moment of actually uploading a frame to WebGL, never earlier at
-    // the <video>.play() stage (which is all playMediaUrl's own try/catch
-    // can see). So this is the one place that can catch it, however the
-    // video got loaded — self-heal into the same no-CRT fallback used when
-    // loading itself fails outright.
-    console.warn('Video turned out CORS-tainted after all (playback worked, pixel access didn\'t) — switching to no-CRT fallback:', err);
+    // Some hosts let the video play but stay CORS-tainted for pixel access;
+    // that only surfaces here (WebGL upload), so fall back to no-CRT mode.
+    console.warn('Video CORS-tainted, switching to no-CRT fallback:', err);
     setCrtFallback(true);
     if (!/no CRT effect/.test(streamStatus.textContent)){
       streamStatus.textContent += ' (no CRT effect — source doesn\'t support it)';
@@ -377,52 +363,26 @@ RectAreaLightUniformsLib.init();
 
 const container = document.getElementById('container');
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x1a1a1a);
+// No opaque background — lets the CSS scrolling tech grid behind the canvas show through.
 
 // Detected early (moved up from the touch-controls section below) so the
 // renderer can pick mobile-friendly settings from the start.
 const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
 
 // ---- 3D house the TV sits inside, loaded from Room.glb (next to
-// index.html — everything is now just index.html + Room.glb + TV.glb,
-// no separate textures/ folder; both .glb files carry their own textures
-// embedded).
-// The house's own units are almost certainly a different scale than the
-// arbitrary units the furniture is normalized to (targetSize below), so it
-// needs to be scaled up/down and have its floor lined up with everything
-// else's base — otherwise it renders as either a speck or a wall filling
-// the whole screen.
-// HOUSE_SCALE, HOUSE_FLOOR_Y, and HOUSE_OFFSET_X/Z are guesses; tune them the
-// same way as the camera height/distance (open devtools, check the logged
-// native size, adjust, refresh), then send me the final numbers.
+// House scaling: its own units differ from the furniture's normalized scale,
+// so it needs scale + floor alignment. Values below are tuned by eye.
 const HOUSE_SCALE = 40;
 const HOUSE_FLOOR_Y = -20;
 const HOUSE_OFFSET_X = 0;
 const HOUSE_OFFSET_Z = 0;
 
-// ---- Where the TV sits inside the house. Tuned the same way as the house
-// constants above: open devtools, walk around in free-roam, and adjust these
-// until the TV is resting against a wall/on a stand at a sensible spot.
-// TV_POSITION is a world-space offset added AFTER the model is centered and
-// scaled, so it's independent of the model's own internal pivot.
-// TV_ROTATION_Y (radians) turns the TV to face out into the room.
+// Where the TV sits in the room. World-space offset applied after centering/scaling.
 const TV_POSITION = new THREE.Vector3(-125, 14, -90);
-// If you rotate the TV, the TV-mode camera approach below (which assumes the
-// screen faces +Z, same as the original fixed viewer) needs updating too.
+// Radians; TV-mode camera below assumes the screen faces +Z.
 let TV_ROTATION_Y = 4.71;
 
-// ---- Where the arcade cabinet sits. Same deal as TV_POSITION above — a
-// starting guess, meant to be walked up to in free-roam (press P to enter
-// placement mode, Tab to cycle to "Arcade") and nudged into its final spot.
-const ARCADE_POSITION = new THREE.Vector3(10, 15, -44);
-let ARCADE_ROTATION_Y = 1.57;
-
-// ---- Generic "placeable items" registry ----
-// Anything nudge-able in placement mode (TV, arcade cabinet, and anything
-// added later) gets registered here once its model has loaded. `placement`
-// is the tunable world-space offset (what nudging changes); `basePosition`
-// is the model's own one-time centering offset and is never touched after
-// load.
+// Registry of nudge-able items in placement mode.
 const placeableItems = [];
 
 function registerPlaceable(name, object3D, placement, rotationY){
@@ -432,10 +392,7 @@ function registerPlaceable(name, object3D, placement, rotationY){
     basePosition: object3D.position.clone(),
     placement,
     rotationY,
-    // Hidden float accumulator — lets held movement keys feel smooth while
-    // `placement` itself (what actually gets applied, and what the HUD
-    // shows) always stays snapped to whole numbers.
-    rawPlacement: placement.clone()
+    rawPlacement: placement.clone() // smooth float accumulator; `placement` stays snapped to whole numbers
   };
   placeableItems.push(item);
   applyPlaceableTransform(item);
@@ -448,9 +405,6 @@ function applyPlaceableTransform(item){
 }
 
 const houseLoader = new GLTFLoader();
-// Never visible in TV-locked mode (camera can't leave the TV, and can't
-// rotate to see anything beside it even before that), so skip the fetch
-// entirely on Android rather than downloading it for nothing.
 if (false){
   houseLoader.load('Room.glb', (gltf) => {
     const house = gltf.scene;
@@ -478,33 +432,17 @@ if (false){
 // TV Stand intentionally not loaded — skipping TVStand.glb entirely to save
 // on load time / GPU memory. Re-add a loader here if it's ever needed again.
 
-// ---- Single orthographic camera, shared by every mode ----
-// Room view (freeroam/placement) and the TV close-up now use the SAME
-// camera object and the SAME orthographic projection — only its position,
-// orientation, and frustum size change between them. Swapping camera
-// *objects* (or projections) always reads as a visible snap the instant it
-// happens, even when position matches exactly, so we avoid that by keeping
-// one object throughout and animating its frustum size right alongside
-// position/rotation during the flight (see startTransition/updateTransition
-// further down).
+// Single orthographic camera shared by all modes — only position/rotation/
+// frustum change between them, to avoid a visible snap on mode switch.
 const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 2000);
 camera.position.set(0, -2, 60);
 
-// Antialiasing (MSAA) and a high device pixel ratio are both expensive for
-// mobile GPUs — each extra pixel-ratio step roughly squares the fragment
-// work, and MSAA multiplies it again on top. Phones fall back to no AA and
-// a lower pixel-ratio cap; desktop keeps the crisper defaults.
-const renderer = new THREE.WebGLRenderer({ antialias: !isTouchDevice });
+// Mobile GPUs: disable AA and cap pixel ratio lower.
+const renderer = new THREE.WebGLRenderer({ antialias: !isTouchDevice, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, isTouchDevice ? 1.5 : 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 container.appendChild(renderer.domElement);
-
-// ---- WebXR (VR headset support) ----
-// Kept enabled on the renderer in case a controller ever drives this, but
-// the on-screen "ENTER VR"/"VR NOT SUPPORTED" button is skipped — it's not
-// needed and was just clutter on unsupported (i.e. most) devices.
-renderer.xr.enabled = true;
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.6));
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
@@ -514,10 +452,8 @@ const fillLight = new THREE.DirectionalLight(0xffffff, 0.4);
 fillLight.position.set(-6, -2, -8);
 scene.add(fillLight);
 
-// ---- Screen "light spill": the screen itself is an unlit MeshBasicMaterial,
-// so by default it doesn't cast any light onto the bezel/edges around it like
-// a real CRT glow does. A RectAreaLight sized to the screen and colored from
-// a live sample of the picture fakes that spill onto the TV's front shell.
+// Screen "light spill": fakes CRT glow onto the bezel using a RectAreaLight
+// sized to the screen and colored from a live sample of the picture.
 let screenGlowLight = null;
 let screenGlowNormal = new THREE.Vector3(0, 0, 1);
 const glowSampleCanvas = document.createElement('canvas');
@@ -600,30 +536,15 @@ function updateScreenGlow(){
   fill.intensity = luminance * 4.0;
 }
 
-// ---- Three camera modes ----
-// 'freeroam'      : the default resting view — an orthographic isometric
-//                   view. Click-drag rotates it, but it only ever snaps to
-//                   one of 4 fixed corner angles (90° apart) on release —
-//                   there's no free orbiting. In placement mode (press P),
-//                   WASD/arrows + Space/Shift also pan the view around so you
-//                   can see what you're positioning.
-// 'tv'            : locked onto the TV screen, still orthographic — only
-//                   the frustum size (much smaller/tighter) and position
-//                   differ from the default view.
-// 'transitioning' : a short animated hand-off between the two above, flown
-//                   with the same camera object (see startTransition below).
+// Camera modes: 'freeroam' (isometric, snaps to 4 corner angles),
+// 'tv' (locked close-up on the screen), 'transitioning' (animated hand-off).
 let mode = 'freeroam';
 
 const tvControls = new OrbitControls(camera, renderer.domElement);
 tvControls.enableDamping = true;
 tvControls.dampingFactor = 0.08;
 
-// Only height (vertical position) and zoom are adjustable. Rotation is
-// fully disabled — drag pans the camera+target straight up/down instead of
-// orbiting, so the TV never spins or tilts. Left/right drift is clamped to
-// zero every frame as a safety net. Zoom (not distance) is what "dolly"
-// means for an orthographic camera — OrbitControls scales camera.zoom
-// instead of moving the camera physically closer.
+// Only height + zoom adjustable; rotation disabled so the TV never spins/tilts.
 tvControls.enableRotate = false;
 tvControls.enablePan = true;
 tvControls.screenSpacePanning = true;
@@ -634,12 +555,8 @@ tvControls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RI
 tvControls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_PAN };
 tvControls.enabled = false;
 
-// The TV camera's height/distance/zoom are remembered here across mode
-// switches, so leaving and re-entering the TV view puts the camera right
-// back where you left it, instead of resetting. Also read immediately by
-// the Android TV-lock below, before TV.glb has necessarily finished
-// loading — so these need to already be the real tuned values, not
-// placeholders to overwrite later once the model loads.
+// Remembers TV camera pose across mode switches so re-entering TV view
+// restores where you left it.
 const savedTVCamera = {
   height: 17.5,
   distance: 55,
@@ -652,12 +569,7 @@ const savedTVCamera = {
 // this like the other constants (smaller = tighter framing on the screen).
 const TV_ORTHO_VIEW_SIZE = 23;
 
-// ---- Orthographic frustum sizing ----
-// "View size" (half-height of the frustum) is what controls how much of the
-// world is visible — smaller = more zoomed in. setOrthoFrustum() is the one
-// place that touches camera.left/right/top/bottom, used by every mode;
-// lastRawViewSize caches whatever was passed in last so resize can reapply
-// it at the new aspect ratio without needing to know which mode we're in.
+// "View size" = half-height of the frustum (smaller = more zoomed in).
 let lastRawViewSize = 140;
 function setOrthoFrustum(viewSize){
   lastRawViewSize = viewSize;
@@ -669,11 +581,7 @@ function setOrthoFrustum(viewSize){
   camera.updateProjectionMatrix();
 }
 
-// ISO_TARGET/ISO_DISTANCE are guesses, same deal as the other constants in
-// this file: tune them (open devtools, watch the room, adjust, refresh)
-// until the room reads nicely from a corner. ISO_ELEVATION_DEG defaults to
-// the "true isometric" angle (arctan(1/√2) ≈ 35.264°); ISO_ORTHO_VIEW_SIZE_BASE
-// controls zoom — smaller = closer in.
+// Isometric view tuning constants.
 const ISO_TARGET = TV_POSITION.clone();
 const ISO_DISTANCE = 220;
 const ISO_ELEVATION_DEG = 35.264;
@@ -687,10 +595,7 @@ let isoZoom = ISO_ZOOM_MIN;
 
 setOrthoFrustum(ISO_ORTHO_VIEW_SIZE_BASE * isoZoom);
 
-// Mouse-wheel / trackpad zoom for the iso view — works in freeroam whether
-// or not placement mode is on, since zoom is just a closer look, not a
-// change to the room's fixed rotation. Trackpad pinch also arrives as a
-// wheel event with deltaY, so this covers both without extra handling.
+// Wheel/trackpad zoom for iso view.
 function onIsoWheel(e){
   if (mode !== 'freeroam') return;
   e.preventDefault();
@@ -699,23 +604,16 @@ function onIsoWheel(e){
 }
 renderer.domElement.addEventListener('wheel', onIsoWheel, { passive: false });
 
-// isoPanOffset shifts ISO_TARGET around in placement mode (WASD/arrows +
-// Space/Shift) — the room itself never moves, just what the camera is
-// centered on.
+// Shifts ISO_TARGET around in placement mode; the room itself never moves.
 const isoPanOffset = new THREE.Vector3(0, 0, 0);
 
-// The single source of truth for "which way is the iso camera currently
-// facing" — a plain compass angle in degrees. It's continuous (not snapped
-// to a corner) while actively dragging or mid-snap-animation; see the drag
-// handlers and updateIsoSnap() further down for how it settles back onto a
-// multiple of 90° from ISO_BASE_AZIMUTH_DEG.
+// Current iso camera compass angle in degrees; snaps to 90° increments
+// from ISO_BASE_AZIMUTH_DEG when not actively dragging (see updateIsoSnap()).
 let isoAzimuthDeg = ISO_BASE_AZIMUTH_DEG;
 
-// Scratch pose — holds where the iso view's camera pose currently computes
-// to, even while TV mode has temporarily taken over the live `camera`. Never
-// added to the scene; just used for its position/quaternion/lookAt math.
+// Scratch pose for iso camera math, used even while TV mode owns `camera`.
 const isoPose = new THREE.Object3D();
-isoPose.isCamera = true; // Object3D.lookAt() faces backwards for plain objects vs cameras — this flag makes it use the camera convention
+isoPose.isCamera = true; // makes lookAt() use camera convention, not Object3D's
 
 function applyIsoCameraPose(azimuthDeg, writeToCamera = true){
   const az = THREE.MathUtils.degToRad(azimuthDeg);
@@ -751,7 +649,7 @@ function onKeyDown(e){
     case 'KeyD': case 'ArrowRight': moveState.right = true; break;
     case 'Space': moveState.up = true; break;
     case 'ShiftLeft': case 'ShiftRight': moveState.down = true; break;
-    case 'Escape': if (mode === 'tv' && !ANDROID_TV_LOCKED) exitTVMode(); break;
+    case 'Escape': if (mode === 'tv') exitTVMode(); break;
     case 'KeyC':
       isoPanOffset.copy(TV_POSITION).sub(ISO_TARGET);
       isoZoom = ISO_ZOOM_MIN;
@@ -871,17 +769,12 @@ function updatePlacement(delta){
   applyPlaceableTransform(item);
 }
 
-// ---- Isometric camera: drag-to-rotate + placement-mode panning ----
-// Click-drag anywhere on the canvas rotates the iso camera live around
-// ISO_TARGET; releasing snaps it to whichever of the 4 fixed corners
-// (90° apart) it ended up closest to — there's no free/arbitrary orbiting.
-// This works in freeroam mode whether or not placement mode is on.
+// Isometric camera: drag-to-rotate, snaps to nearest of 4 fixed corners on release.
 let isoDragging = false;
 let isoDragStartX = 0;
 let isoDragStartAzimuth = 0;
 
-// A quick eased hand-off from wherever the drag let go to the snapped-to
-// corner — isoSnapT >= 1 means "not currently snapping".
+// Eased hand-off from drag release to the snapped corner (isoSnapT >= 1 = done).
 let isoSnapFrom = 0, isoSnapTo = 0, isoSnapT = 1;
 const ISO_SNAP_DURATION = 0.35;
 const ISO_DRAG_SENSITIVITY = 0.25; // degrees rotated per pixel dragged
@@ -913,8 +806,7 @@ renderer.domElement.addEventListener('pointerdown', onIsoDragDown);
 window.addEventListener('pointermove', onIsoDragMove);
 window.addEventListener('pointerup', onIsoDragUp);
 
-// Called every frame; eases isoAzimuthDeg the rest of the way to the
-// snapped-to corner after a drag release. No-op once settled (isoSnapT >= 1).
+// Eases isoAzimuthDeg to the snapped corner after drag release.
 function updateIsoSnap(delta){
   if (isoSnapT >= 1) return;
   isoSnapT = Math.min(isoSnapT + delta / ISO_SNAP_DURATION, 1);
@@ -923,10 +815,8 @@ function updateIsoSnap(delta){
   applyIsoCameraPose(isoAzimuthDeg);
 }
 
-// Placement mode also pans the view (WASD/arrows + Space/Shift), shifting
-// isoPanOffset instead of moving the camera directly — direction is relative
-// to whichever way the iso camera currently faces, so "forward" always
-// means "into the screen" regardless of which corner you're looking from.
+// Placement mode pans the view (WASD/arrows + Space/Shift), relative to
+// current facing direction.
 function updateFreeRoam(delta){
   if (!placementMode) return;
   const step = WALK_SPEED * delta;
@@ -955,14 +845,7 @@ const streamPanel = document.getElementById('streamPanel');
 const streamUrlInput = document.getElementById('streamUrlInput');
 const streamStatus = document.getElementById('streamStatus');
 
-// ---- Remembering recently-loaded sources (localStorage) ----
-// Purely a convenience for whoever's actually using the page — a small MRU
-// list of links they've typed in before, so a channel-list URL or a direct
-// .mp4 doesn't have to be retyped/re-pasted every visit. Stored under the
-// page's own origin in localStorage, so it survives reloads and browser
-// restarts but never leaves the browser (no server, no account, nothing
-// synced) — clearing site data or using a different browser/device starts
-// a fresh list.
+// Recently-loaded sources, stored in localStorage (client-only, no server).
 const RECENT_SOURCES_KEY = 'tv3d.recentSources.v1';
 const MAX_RECENT_SOURCES = 8;
 const recentSourcesList = document.getElementById('recentSourcesList');
@@ -973,10 +856,7 @@ function readRecentSources(){
     const list = JSON.parse(localStorage.getItem(RECENT_SOURCES_KEY) || '[]');
     return Array.isArray(list) ? list : [];
   } catch (err){
-    // Private/incognito windows and some locked-down settings can make
-    // localStorage throw rather than just fail quietly — treat that the
-    // same as "no history yet" instead of breaking the page over it.
-    return [];
+    return []; // private/incognito localStorage can throw; treat as empty
   }
 }
 
@@ -988,9 +868,7 @@ function writeRecentSources(list){
   }
 }
 
-// Short display label for a (possibly very long) URL — host + path, no
-// query string, so an Xtream-Codes-style link with an embedded username/
-// password doesn't get plastered across the panel in full.
+// Host + path only (no query string), so credentials in the URL aren't shown.
 function shortSourceLabel(url){
   try {
     const u = new URL(url);
@@ -1033,11 +911,7 @@ function renderRecentSources(){
   }
 }
 
-// Called from loadStreamUrl() whenever a link is submitted — remembered up
-// front rather than only on confirmed success, same as a browser's own
-// address-bar history, since even a channel-list link that fails once
-// (dead server, temporary CORS hiccup) is usually still worth keeping
-// around to retry later.
+// Remembered on submit regardless of success (like browser address history).
 function rememberRecentSource(url){
   const list = readRecentSources().filter((u) => u !== url);
   list.unshift(url);
@@ -1052,36 +926,8 @@ clearRecentBtn.addEventListener('click', () => {
 
 renderRecentSources(); // show whatever's left over from a previous visit
 
-// ---- Android: TV-only mode, no way back to the rest of the world ----
-// On Android specifically (not iOS, not desktop), skip free-roam entirely —
-// start already zoomed into the TV, and disable every path that would
-// normally leave that view (Escape, clicking/tapping off the TV). Touch pan
-// (one finger) and pinch-zoom (two fingers) still work since tvControls
-// already supports touch — see tvControls.touches above — so it's still a
-// usable little viewer, just permanently framed on the TV instead of the
-// room around it. (ANDROID_TV_LOCKED itself is detected up top, before any
-// model loads, so the house loader further up can skip fetching entirely.)
-if (ANDROID_TV_LOCKED){
-  mode = 'tv';
-  camera.position.set(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ + savedTVCamera.distance);
-  tvControls.target.set(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ);
-  camera.lookAt(tvControls.target);
-  camera.zoom = savedTVCamera.zoom;
-  setOrthoFrustum(TV_ORTHO_VIEW_SIZE);
-  tvControls.enabled = true;
-  tvControls.update();
-  streamPanel.style.display = 'block';
-}
-
-// ---- CRT-fallback mode ----
-// The CRT effect needs pixel access to the video (drawImage'd onto a canvas,
-// then uploaded to WebGL for the shader) — which needs the video loaded with
-// crossOrigin="anonymous" AND the source server actually sending back CORS
-// headers. Plenty of direct-file hosts don't, so if a URL fails with
-// crossOrigin set, we retry it without crossOrigin — no pixel/canvas access
-// then, but at least normal playback isn't blocked, since that never needed
-// CORS in the first place. When that's the situation, skip the CRT pipeline
-// entirely and just show the raw <video> element directly instead.
+// CRT-fallback: some hosts don't send CORS headers, blocking pixel access.
+// When that happens, skip the CRT pipeline and just show the raw <video>.
 let crtFallbackActive = false;
 
 function setCrtFallback(active){
@@ -1104,35 +950,20 @@ function setCrtFallback(active){
   }
 }
 
-// ---- Loading a user-supplied link onto the TV ----
-// Direct video files (.mp4, .webm, etc.) just get set as the <video> src.
-// Genuine HLS streams (.m3u8 media/master playlists for ONE video) go
-// through hls.js, loaded on demand from a CDN, except on Safari which plays
-// them natively.
-//
-// A lot of "m3u8 links" people actually paste in are IPTV-style channel
-// *lists* though — a playlist file whose #EXTINF entries each point to a
-// totally different stream (one per channel), rather than being the stream
-// itself. Those need to be fetched and parsed so we know there are multiple
-// channels to switch between; see parseChannelList().
+// Loading a user-supplied link: direct video files set as <video> src;
+// HLS streams go through hls.js (native on Safari). Some "m3u8 links" are
+// actually IPTV channel lists (many streams, one per channel) — those get
+// parsed via parseChannelList() instead of played directly.
 let hls = null;
 
-// Deliberately broad: covers plain .m3u/.m3u8 links, ones with a query
-// string after the extension, and the common Xtream-Codes-style
-// "get.php?...type=m3u_plus..." links that don't have an .m3u8 extension
-// at all but still return one. False positives here are harmless — we only
-// use this to decide whether it's worth fetching+sniffing the body; actual
-// playback decisions come from what's really in that body.
+// Broad match for m3u/m3u8-ish URLs, including Xtream-Codes get.php links
+// without the extension. False positives are harmless — just gates the fetch.
 function looksLikeM3U(url){
   return /\.m3u8?(\?|#|$)/i.test(url) || /[?&]type=m3u/i.test(url) || /get\.php\?/i.test(url);
 }
 
-// A real HLS playlist (master or media) is also #EXTM3U, so "starts with
-// #EXTM3U" alone doesn't tell channel lists and genuine streams apart.
-// Master/media playlists carry HLS-specific tags (#EXT-X-STREAM-INF for a
-// master listing bitrates of the SAME video, #EXT-X-TARGETDURATION for a
-// media playlist listing that video's segments) — an IPTV channel list has
-// neither, just repeated #EXTINF/url pairs pointing at unrelated channels.
+// A real HLS playlist is also #EXTM3U, but carries HLS-specific tags
+// (#EXT-X-STREAM-INF / #EXT-X-TARGETDURATION); a channel list has neither.
 function parseChannelList(text){
   if (!/^\s*#EXTM3U/.test(text)) return null;
   if (/#EXT-X-STREAM-INF|#EXT-X-TARGETDURATION/.test(text)) return null;
@@ -1182,10 +1013,8 @@ function looksLikePlaylistText(text){
   return typeof text === 'string' && /^\s*#EXTM3U/.test(text);
 }
 
-// Rewrites every URI in a playlist — plain lines (segments, nested
-// playlists) and `URI="..."` attributes (#EXT-X-KEY, #EXT-X-MAP, etc.) —
-// into an absolute URL (resolved against `base`, the real unproxied URL
-// this playlist came from) wrapped in the same proxy.
+// Rewrites every URI in a playlist (plain lines + URI="..." attributes)
+// into an absolute, proxy-wrapped URL.
 function rewritePlaylistUrls(text, base, prefix){
   const toProxied = (uri) => {
     try {
@@ -1204,17 +1033,12 @@ function rewritePlaylistUrls(text, base, prefix){
   }).join('\n');
 }
 
-// Builds an hls.js loader class bound to one proxy prefix. Manifest, level/
-// variant playlists, audio/subtitle tracks, keys, and fragments all share
-// this one `loader` slot (hls.js only splits fLoader/pLoader out separately
-// if you configure those too, which we don't), so binding it once here
-// covers every request type in the tree.
+// One hls.js loader class bound to a proxy prefix, covering manifest,
+// variant playlists, tracks, keys, and fragments.
 function makeHlsProxyLoader(BaseLoader, prefix){
   return class ProxyAwareLoader extends BaseLoader {
     load(context, config, callbacks){
-      // context.url might already be one of ours (e.g. a variant playlist
-      // URL we ourselves rewrote a moment ago) — unwrap back to the real
-      // URL first so we always know the true base, then re-wrap once.
+      // Unwrap if already proxied, so we always know the true base URL.
       const realUrl = context.url.startsWith(prefix)
         ? decodeURIComponent(context.url.slice(prefix.length))
         : context.url;
@@ -1232,14 +1056,8 @@ function makeHlsProxyLoader(BaseLoader, prefix){
   };
 }
 
-// Does the actual work of getting a URL playing on the <video> element —
-// either a direct file (.mp4/.webm/etc.) or a genuine HLS stream (native on
-// Safari, hls.js elsewhere). Shared by every attempt in playMediaUrl() below
-// (first unproxied, then once per CORS_PROXIES entry, then unproxied again
-// as a last resort) so the branching logic only has to live in one place.
-// `prefix` is '' for an unproxied attempt, or one of CORS_PROXIES' entries.
-// Proxying happens in here now, rather than playMediaUrl swapping the URL
-// beforehand, because HLS needs more than a single URL swap (see above).
+// Plays a URL on the <video> element — direct file or HLS (native Safari
+// or hls.js). `prefix` is '' for unproxied, or a CORS_PROXIES entry.
 async function loadIntoVideoElement(realUrl, prefix){
   if (hls){ hls.destroy(); hls = null; }
   vid.pause();
@@ -1248,9 +1066,7 @@ async function loadIntoVideoElement(realUrl, prefix){
 
   if (looksLikeM3U(realUrl)){
     if (vid.canPlayType('application/vnd.apple.mpegurl')){
-      // Native HLS support (Safari) — no hls.js, so no way to intercept the
-      // sub-requests it makes internally. A proxy here only ever covers the
-      // top-level manifest fetch, same limitation as before this change.
+      // Native HLS (Safari) — no hls.js, so sub-requests can't be intercepted.
       vid.src = prefix ? proxied(prefix, realUrl) : realUrl;
       await vid.play();
     } else {
@@ -1266,35 +1082,16 @@ async function loadIntoVideoElement(realUrl, prefix){
       await vid.play();
     }
   } else {
-    // Anything else — .mp4, .webm, etc. — is just a normal video src, so
-    // the original single-URL-swap trick is all a proxy needs to do here.
     vid.src = prefix ? proxied(prefix, realUrl) : realUrl;
     await vid.play();
   }
 }
 
-// Plays a single media URL — this is the shared bottom layer for both
-// loadStreamUrl() (first load) and tuneToChannel() (Up/Down switching within
-// a loaded list). Always tries with CORS requested first (needed for the CRT
-// effect); if that fails — a lot of direct-file hosts don't send CORS
-// headers at all — retries once without it and, if that works, falls back to
-// showing the raw video directly instead of the CRT-processed one.
-// CORS proxies, tried in order — each re-fetches the URL and re-serves it
-// with permissive CORS headers, so a host that never intended to support
-// cross-origin canvas/WebGL access effectively does anyway. For a direct
-// file (.mp4/.webm/etc.) that's a single URL swap. For genuine HLS (.m3u8)
-// streams it's more involved — hls.js's manifest tree needs every request
-// proxied, plus rewritten URIs so relative segment paths resolve against
-// the real host instead of the proxy — see the loader built in
-// loadIntoVideoElement() above (makeHlsProxyLoader) for how that's handled.
-//
-// First slot is your own Cloudflare Worker (see the worker code + deploy
-// steps you were given alongside this) — reliable, not shared/rate-limited/
-// blacklisted the way a public proxy can be, so it's worth putting first
-// once it's deployed. Paste its URL in below; leave '' to skip it. The rest
-// are public fallbacks — free, no setup, but occasionally blocked by a given
-// host or proxy itself (as with corsproxy.io + hypnohub returning a 403),
-// which is exactly why there's more than one.
+// Plays a media URL: tries direct with CORS first (needed for the CRT
+// effect), then each CORS proxy in order, then direct without CORS as a
+// last resort (works, but skips the CRT effect).
+// First proxy is a dedicated Cloudflare Worker; the rest are public
+// fallbacks in case one gets blocked by a given host.
 const CORS_PROXIES = [
   'https://broken-paper-d384.kcmegalonio.workers.dev/?url=',
   'https://corsproxy.io/?url=',
@@ -1346,8 +1143,7 @@ async function tuneToChannel(index){
   }
 }
 
-// Up/Down while sat at the TV step through a loaded channel list. No-op if
-// nothing multi-channel is currently loaded.
+// Up/Down at the TV step through a loaded channel list.
 function changeChannelBy(delta){
   if (!channelList || channelList.length < 2) return;
   const next = (channelIndex + delta + channelList.length) % channelList.length;
@@ -1364,12 +1160,9 @@ async function loadStreamUrl(url){
   flashStatic(350);
   channelList = null;
 
-  // If this smells like an m3u/m3u8 link, fetch its actual contents first —
-  // that's the only reliable way to tell "one HLS stream" from "a list of
-  // many channels" apart, since both share the same file extension (or, for
-  // Xtream-Codes-style get.php links, no extension at all). If the fetch
-  // fails (e.g. blocked by CORS, which many IPTV hosts don't set), we just
-  // fall through and hand the raw URL to playMediaUrl() as before.
+  // If this looks like an m3u/m3u8 link, fetch it to check if it's a
+  // multi-channel list vs a single stream. Falls through to playMediaUrl()
+  // on fetch failure (e.g. CORS).
   if (looksLikeM3U(url)){
     try {
       const res = await fetch(url);
@@ -1399,10 +1192,7 @@ streamUrlInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') loadStreamUrl(streamUrlInput.value);
 });
 
-// While sat at the TV, Up/Down (plus W/S, and Z since AZERTY swaps W<->Z)
-// step through a loaded channel list. Clicking the screen (surfChannel(),
-// bound elsewhere) is deliberately separate — it only re-seeks whatever's
-// currently loaded and never changes `channelIndex`.
+// At the TV, Up/Down (+ W/S, Z for AZERTY) step through a loaded channel list.
 document.addEventListener('keydown', (e) => {
   if (mode !== 'tv') return;
   switch (e.code){
@@ -1415,9 +1205,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// ---- Smooth hand-off between free-roam and TV view ----
-// Rather than snapping the camera instantly, we animate position + facing
-// from wherever it currently is to the destination pose over a short window.
+// Smoothly animates the camera between free-roam and TV view instead of snapping.
 const TRANSITION_DURATION = 0.6; // seconds
 let transitionT = 1; // 1 = idle/finished
 let pendingMode = null;
@@ -1430,11 +1218,8 @@ function quatLookingAt(fromPos, toPos){
   return new THREE.Quaternion().setFromRotationMatrix(lookAtMatrix);
 }
 
-// The frustum's raw bounds ("view size") combine with camera.zoom to give
-// the actual visible extent (roughly viewSize / zoom) — see setOrthoFrustum.
-// This reads off whatever that combined, actually-visible size is right now,
-// for whichever mode is currently live, so a transition can start from
-// exactly what's on screen with no jump.
+// Actual visible size combines frustum bounds with camera.zoom — reads
+// off the current effective size so a transition starts with no jump.
 function currentEffectiveViewSize(){
   if (mode === 'tv') return TV_ORTHO_VIEW_SIZE / camera.zoom;
   return ISO_ORTHO_VIEW_SIZE_BASE * isoZoom;
@@ -1646,8 +1431,6 @@ screenTexture.flipY = false;
 let screenMesh = null;
 let tvModel = null;
 let tvOutlineMesh = null;
-let arcadeModel = null;
-let arcadeOutlineMesh = null;
 
 // ---- "Inverted hull" toon outline ----
 // Classic cartoon-outline trick: render a second copy of the mesh, pushed
@@ -1672,13 +1455,6 @@ const outlineMaterial = new THREE.ShaderMaterial({
   `,
   side: THREE.BackSide
 });
-
-// Same trick, second copy — a fresh clone (not the same instance) so its
-// outlineWidth uniform can be set independently. The TV and the arcade are
-// scaled very differently (targetSize 40 vs 70), so sharing one material's
-// uniform would mean whichever model loaded last "wins" and both outlines
-// end up the wrong thickness.
-const arcadeOutlineMaterial = outlineMaterial.clone();
 
 // ---- TV, loaded from TV.glb ----
 // Self-contained now — PBR body textures, glass, and the glowing screen
@@ -1761,181 +1537,6 @@ tvLoader.load('TV.glb', (gltf) => {
   console.error('Error loading TV.glb:', err);
   document.getElementById('loading').textContent = 'Failed to load TV model — check console.';
 });
-
-// ---- Arcade cabinet: disabled for now ----
-// Turned out the screen-as-video-player idea needed real reverse-engineering
-// (its screen isn't a separate mesh/material like the TV's — see the comment
-// below) with no way to confirm the result without live visual feedback.
-// Not worth it right now, so the whole cabinet (spawn, screen patch, hover
-// outline setup) is commented out below rather than deleted, in case it's
-// worth revisiting later.
-/*
-// ---- Arcade cabinet screen ----
-// This model's screen isn't its own mesh/material the way the TV's is — the
-// whole cabinet (body, bezel, screen, everything) is one continuous surface
-// sharing one texture atlas, with the screen artwork just baked into one
-// small rectangle of it. So instead of swapping a material, we clone that
-// atlas's baseColor + emissive images onto our own canvases once, and every
-// frame redraw just that rectangle with the live CRT feed — the rest of the
-// cabinet's art stays exactly as exported.
-//
-// That rectangle's UV mapping runs rotated relative to the cabinet's actual
-// physical axes (found by tracing which vertices share that part of the
-// atlas) — a normal side effect of how the unwrap was packed, not something
-// we can just read off the model. So the video patch needs a matching
-// rotation/flip to land right-side-up, and there's no way to derive that
-// blind — press C to cycle rotation in 90° steps, V to flip horizontally,
-// X to flip vertically, and check how it looks. The HUD shows the current
-// combination; once it's right, report the values back to get them
-// hardcoded as the default.
-const ARCADE_SCREEN_UV = { u0: 0.7218, u1: 0.7926, v0: 0.6077, v1: 0.8260 };
-let arcadeScreenRotation = 0; // degrees: 0, 90, 180, or 270
-let arcadeScreenFlipH = false;
-let arcadeScreenFlipV = false;
-
-let arcadeBaseColorCanvas = null, arcadeBaseColorCtx = null, arcadeBaseColorTexture = null;
-let arcadeEmissiveCanvas = null, arcadeEmissiveCtx = null, arcadeEmissiveTexture = null;
-
-function setupArcadeScreen(cabinetMesh){
-  const mat = cabinetMesh.material;
-  const baseImg = mat.map ? mat.map.image : null;
-  const emisImg = mat.emissiveMap ? mat.emissiveMap.image : null;
-  if (!baseImg || !emisImg){
-    console.warn('Arcade cabinet material is missing its baseColor/emissive textures — screen patch skipped.');
-    return;
-  }
-
-  arcadeBaseColorCanvas = document.createElement('canvas');
-  arcadeBaseColorCanvas.width = baseImg.width;
-  arcadeBaseColorCanvas.height = baseImg.height;
-  arcadeBaseColorCtx = arcadeBaseColorCanvas.getContext('2d');
-  arcadeBaseColorCtx.drawImage(baseImg, 0, 0);
-
-  arcadeEmissiveCanvas = document.createElement('canvas');
-  arcadeEmissiveCanvas.width = emisImg.width;
-  arcadeEmissiveCanvas.height = emisImg.height;
-  arcadeEmissiveCtx = arcadeEmissiveCanvas.getContext('2d');
-  arcadeEmissiveCtx.drawImage(emisImg, 0, 0);
-
-  arcadeBaseColorTexture = new THREE.CanvasTexture(arcadeBaseColorCanvas);
-  arcadeBaseColorTexture.colorSpace = THREE.SRGBColorSpace;
-  arcadeBaseColorTexture.flipY = false; // match how GLTFLoader loaded the original (see the TV's screenTexture.flipY fix above for why)
-  arcadeBaseColorTexture.minFilter = THREE.LinearFilter;
-  arcadeBaseColorTexture.magFilter = THREE.LinearFilter;
-
-  arcadeEmissiveTexture = new THREE.CanvasTexture(arcadeEmissiveCanvas);
-  arcadeEmissiveTexture.colorSpace = THREE.SRGBColorSpace;
-  arcadeEmissiveTexture.flipY = false;
-  arcadeEmissiveTexture.minFilter = THREE.LinearFilter;
-  arcadeEmissiveTexture.magFilter = THREE.LinearFilter;
-
-  mat.map = arcadeBaseColorTexture;
-  mat.emissiveMap = arcadeEmissiveTexture;
-  mat.needsUpdate = true;
-}
-
-function drawArcadeScreenPatch(){
-  if (!arcadeBaseColorCtx || !arcadeEmissiveCtx) return;
-
-  const drawInto = (ctx, w, h, blackout) => {
-    const x0 = ARCADE_SCREEN_UV.u0 * w;
-    const x1 = ARCADE_SCREEN_UV.u1 * w;
-    const y0 = ARCADE_SCREEN_UV.v0 * h;
-    const y1 = ARCADE_SCREEN_UV.v1 * h;
-    const pw = x1 - x0, ph = y1 - y0;
-
-    ctx.save();
-    ctx.translate(x0 + pw / 2, y0 + ph / 2);
-    ctx.rotate(arcadeScreenRotation * Math.PI / 180);
-    ctx.scale(arcadeScreenFlipH ? -1 : 1, arcadeScreenFlipV ? -1 : 1);
-    // A 90/270 rotation swaps which patch dimension the video's width vs
-    // height land on — swap dw/dh to match so the picture isn't stretched.
-    const rotated90 = (arcadeScreenRotation % 180) !== 0;
-    const dw = rotated90 ? ph : pw;
-    const dh = rotated90 ? pw : ph;
-    if (blackout){
-      ctx.fillStyle = '#000';
-      ctx.fillRect(-dw / 2, -dh / 2, dw, dh);
-    } else {
-      ctx.drawImage(paddedCanvas, -dw / 2, -dh / 2, dw, dh);
-    }
-    ctx.restore();
-  };
-
-  // Base color gets blacked out under the patch (like the TV glass's black
-  // base) so the video doesn't ghost against the cabinet's original baked
-  // screenshot artwork; emissive gets the actual live picture.
-  drawInto(arcadeBaseColorCtx, arcadeBaseColorCanvas.width, arcadeBaseColorCanvas.height, true);
-  drawInto(arcadeEmissiveCtx, arcadeEmissiveCanvas.width, arcadeEmissiveCanvas.height, false);
-
-  arcadeBaseColorTexture.needsUpdate = true;
-  arcadeEmissiveTexture.needsUpdate = true;
-}
-
-function onArcadeScreenOrientKeyDown(e){
-  switch (e.code){
-    case 'KeyC': arcadeScreenRotation = (arcadeScreenRotation + 90) % 360; break;
-    case 'KeyV': arcadeScreenFlipH = !arcadeScreenFlipH; break;
-    case 'KeyX': arcadeScreenFlipV = !arcadeScreenFlipV; break;
-    default: return;
-  }
-  camHud.style.display = '';
-  camHud.textContent = `arcade screen orient — rotation: ${arcadeScreenRotation}  flipH: ${arcadeScreenFlipH}  flipV: ${arcadeScreenFlipV}\n(C: rotate 90°, V: flip horizontal, X: flip vertical)`;
-}
-document.addEventListener('keydown', onArcadeScreenOrientKeyDown);
-
-// ---- Arcade cabinet, loaded from Arcade.glb ----
-// Same centering/scaling treatment as the TV, registered as both collidable
-// (can't walk through it) and placeable (nudge-able with P same as the TV).
-// It now also plays the same live feed as the TV — see setupArcadeScreen /
-// drawArcadeScreenPatch below for how, since unlike the TV this screen isn't
-// a separate mesh/material we can just swap. No click-to-sit — it's not a
-// dedicated viewing spot, just a second place to catch the same broadcast.
-const ARCADE_TARGET_SIZE = 70; // a guess at a sensible cabinet height relative to the TV's 40; nudge/rescale once you see it in place
-const arcadeLoader = new GLTFLoader();
-arcadeLoader.load('Arcade.glb', (gltf) => {
-  const model = gltf.scene;
-
-  const box = new THREE.Box3().setFromObject(model);
-  const size = new THREE.Vector3();
-  box.getSize(size);
-  const center = new THREE.Vector3();
-  box.getCenter(center);
-  model.position.sub(center);
-
-  const maxDim = Math.max(size.x, size.y, size.z);
-  model.scale.setScalar(ARCADE_TARGET_SIZE / maxDim);
-
-  scene.add(model);
-  registerPlaceable('Arcade', model, ARCADE_POSITION, ARCADE_ROTATION_Y);
-  makeCollidable(model);
-
-  arcadeModel = model;
-
-  // The screen isn't a separate mesh/material like the TV's — it's a small
-  // rectangle of a single continuous cabinet mesh/atlas ("cbnit"). Find that
-  // mesh and set up the live video patch on it.
-  model.traverse((child) => {
-    if (child.isMesh && child.material && child.material.name === 'cbnit'){
-      setupArcadeScreen(child);
-    }
-  });
-
-  // Hover feedback, same "inverted hull" trick as the TV: a cloned copy
-  // rendered with the outline shader, toggled on/off based on where the
-  // cursor/crosshair is pointing.
-  arcadeOutlineMesh = model.clone(true);
-  arcadeOutlineMesh.traverse((child) => {
-    if (child.isMesh) child.material = arcadeOutlineMaterial;
-  });
-  arcadeOutlineMaterial.uniforms.outlineWidth.value = maxDim * 0.02;
-  arcadeOutlineMesh.visible = false;
-  scene.add(arcadeOutlineMesh);
-}, undefined, (err) => {
-  console.error('Error loading Arcade.glb:', err);
-});
-*/
-
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 let pointerDownAt = 0, pointerDownPos = new THREE.Vector2();
@@ -1981,7 +1582,7 @@ function onPointerUp(e){
   if (mode === 'tv'){
     const tvHits = raycastFromClient(e.clientX, e.clientY, tvModel);
     if (tvHits.length === 0){
-      if (!ANDROID_TV_LOCKED) exitTVMode();
+      exitTVMode();
       return;
     }
     if (screenMesh && tvHits.some(h => h.object === screenMesh)){
@@ -2010,7 +1611,6 @@ function animate() {
     drawCRTFrame();
     updateOverscanAdjust(delta);
     drawPaddedFrame();
-    // drawArcadeScreenPatch(); // arcade cabinet is disabled for now, see comment block above its loader
     screenTexture.needsUpdate = true;
     updateScreenGlow();
   }
