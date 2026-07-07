@@ -37,6 +37,26 @@
   #streamPanel button:hover { background:#333; }
   #streamStatus { margin-top:7px; font-size:11px; opacity:0.75; min-height:14px; }
 
+  #recentSources { margin-top:10px; display:none; }
+  #recentSourcesHead {
+    display:flex; justify-content:space-between; align-items:center;
+    font-size:10px; opacity:0.6; margin-bottom:5px;
+  }
+  #clearRecentBtn { cursor:pointer; text-decoration:underline; opacity:0.85; }
+  #clearRecentBtn:hover { opacity:1; }
+  #recentSourcesList { max-height:120px; overflow-y:auto; }
+  .recentItem {
+    display:flex; align-items:center; gap:6px; padding:5px 7px;
+    margin-bottom:4px; border-radius:5px; background:rgba(255,255,255,0.06);
+    cursor:pointer; font-size:11px;
+  }
+  .recentItem:hover { background:rgba(255,255,255,0.16); }
+  .recentItem .recentLabel {
+    flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .recentItem .recentRemove { opacity:0.5; flex-shrink:0; }
+  .recentItem .recentRemove:hover { opacity:1; }
+
   /* ---- Mobile on-screen joystick (movement) ---- */
   #joystickZone {
     position:absolute; left:20px; bottom:20px; width:130px; height:130px;
@@ -72,6 +92,13 @@
   <input id="streamUrlInput" type="text" placeholder="https://example.com/video.mp4" autocomplete="off">
   <button id="streamLoadBtn">Play</button>
   <div id="streamStatus"></div>
+  <div id="recentSources">
+    <div id="recentSourcesHead">
+      <span>Recent</span>
+      <span id="clearRecentBtn">clear</span>
+    </div>
+    <div id="recentSourcesList"></div>
+  </div>
 </div>
 
 <canvas id="srcCanvas" width="256" height="240"></canvas>
@@ -96,18 +123,23 @@ import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUnifo
 
 /* ---- PART 1: original CRT pipeline (video -> NES-res canvas -> WebGL shader) ---- */
 
+// Detected up front, before any model loads, so it can gate which assets
+// even get fetched (the house never needs to load at all on Android — see
+// the Duplex.glb loader below) as well as the camera/exit behavior further
+// down (see the "Android: TV-only mode" block).
+const ANDROID_TV_LOCKED = /Android/i.test(navigator.userAgent);
+
 const vid = document.getElementById('vid');
 const src = document.getElementById('srcCanvas');
 const sctx = src.getContext('2d');
 const crtCanvas = document.getElementById('crtCanvas');
 
-// No single fixed video baked in — instead, a random channel from a default
-// public IPTV list is loaded on page load (see loadDefaultChannelRandomly()
-// further down, near the rest of the stream-loading logic). Once something
-// IS loaded (default or user-supplied), jump to a random point in it
-// whenever it (re)loads, same as before — except for live streams (duration
-// is Infinity/NaN there), which just play from the live edge since there's
-// nothing to seek into.
+// No single fixed video baked in, and nothing loads automatically either —
+// the TV just sits there dark/off until a link is pasted into the stream
+// panel (see loadStreamUrl() further down). Once something IS loaded, jump
+// to a random point in it whenever it (re)loads, same as before — except
+// for live streams (duration is Infinity/NaN there), which just play from
+// the live edge since there's nothing to seek into.
 vid.addEventListener('loadedmetadata', () => {
   if (Number.isFinite(vid.duration) && vid.duration > 0){
     vid.currentTime = Math.random() * vid.duration;
@@ -336,7 +368,23 @@ function drawCRTFrame(){
   gl.viewport(0, 0, crtCanvas.width, crtCanvas.height);
   gl.useProgram(crtProgram);
   gl.bindTexture(gl.TEXTURE_2D, crtTexture);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+  try {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+  } catch (err){
+    // Some hosts (proxied or not) let the video actually play but still
+    // leave it CORS-tainted for pixel access — that only ever shows up here,
+    // at the moment of actually uploading a frame to WebGL, never earlier at
+    // the <video>.play() stage (which is all playMediaUrl's own try/catch
+    // can see). So this is the one place that can catch it, however the
+    // video got loaded — self-heal into the same no-CRT fallback used when
+    // loading itself fails outright.
+    console.warn('Video turned out CORS-tainted after all (playback worked, pixel access didn\'t) — switching to no-CRT fallback:', err);
+    setCrtFallback(true);
+    if (!/no CRT effect/.test(streamStatus.textContent)){
+      streamStatus.textContent += ' (no CRT effect — source doesn\'t support it)';
+    }
+    return;
+  }
   gl.uniform1i(crtUniforms.tex, 0);
   gl.uniform2f(crtUniforms.srcRes, W, H);
   gl.uniform1f(crtUniforms.curvature, 0.30);
@@ -459,28 +507,33 @@ function applyPlaceableTransform(item){
 }
 
 const houseLoader = new GLTFLoader();
-houseLoader.load('Duplex.glb', (gltf) => {
-  const house = gltf.scene;
+// Never visible in TV-locked mode (camera can't leave the TV, and can't
+// rotate to see anything beside it even before that), so skip the fetch
+// entirely on Android rather than downloading it for nothing.
+if (!ANDROID_TV_LOCKED){
+  houseLoader.load('Duplex.glb', (gltf) => {
+    const house = gltf.scene;
 
-  const box = new THREE.Box3().setFromObject(house);
-  const size = new THREE.Vector3();
-  box.getSize(size);
-  const center = new THREE.Vector3();
-  box.getCenter(center);
+    const box = new THREE.Box3().setFromObject(house);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const center = new THREE.Vector3();
+    box.getCenter(center);
 
-  house.scale.setScalar(HOUSE_SCALE);
-  house.position.set(
-    HOUSE_OFFSET_X - HOUSE_SCALE * center.x,
-    HOUSE_FLOOR_Y - HOUSE_SCALE * box.min.y,
-    HOUSE_OFFSET_Z - HOUSE_SCALE * center.z
-  );
+    house.scale.setScalar(HOUSE_SCALE);
+    house.position.set(
+      HOUSE_OFFSET_X - HOUSE_SCALE * center.x,
+      HOUSE_FLOOR_Y - HOUSE_SCALE * box.min.y,
+      HOUSE_OFFSET_Z - HOUSE_SCALE * center.z
+    );
 
-  scene.add(house);
-  makeCollidable(house);
-  console.log('House native size:', size, '-> scaled size:', size.clone().multiplyScalar(HOUSE_SCALE));
-}, undefined, (err) => {
-  console.error('Error loading Duplex.glb:', err);
-});
+    scene.add(house);
+    makeCollidable(house);
+    console.log('House native size:', size, '-> scaled size:', size.clone().multiplyScalar(HOUSE_SCALE));
+  }, undefined, (err) => {
+    console.error('Error loading Duplex.glb:', err);
+  });
+}
 
 // TV Stand intentionally not loaded — skipping TVStand.glb entirely to save
 // on load time / GPU memory. Re-add a loader here if it's ever needed again.
@@ -624,12 +677,15 @@ tvControls.enabled = false;
 
 // The TV camera's height/distance are remembered here across mode switches,
 // so leaving and re-entering the TV view puts the camera right back where
-// you left it, instead of resetting.
+// you left it, instead of resetting. Also read immediately by the Android
+// TV-lock below, before TV.glb has necessarily finished loading — so these
+// need to already be the real tuned values, not placeholders to overwrite
+// later once the model loads.
 const savedTVCamera = {
-  height: 40,
-  distance: 120,
-  targetX: 0,
-  targetZ: 0
+  height: 17.5,
+  distance: 55,
+  targetX: TV_POSITION.x,
+  targetZ: TV_POSITION.z
 };
 
 const freeRoamControls = new PointerLockControls(camera, renderer.domElement);
@@ -659,7 +715,7 @@ function onKeyDown(e){
     // acts on up/down when placementMode is on, so they're inert otherwise.
     case 'Space': moveState.up = true; break;
     case 'ShiftLeft': case 'ShiftRight': moveState.down = true; break;
-    case 'Escape': if (mode === 'tv') exitTVMode(); break;
+    case 'Escape': if (mode === 'tv' && !ANDROID_TV_LOCKED) exitTVMode(); break;
   }
 }
 function onKeyUp(e){
@@ -999,6 +1055,160 @@ const streamPanel = document.getElementById('streamPanel');
 const streamUrlInput = document.getElementById('streamUrlInput');
 const streamStatus = document.getElementById('streamStatus');
 
+// ---- Remembering recently-loaded sources (localStorage) ----
+// Purely a convenience for whoever's actually using the page — a small MRU
+// list of links they've typed in before, so a channel-list URL or a direct
+// .mp4 doesn't have to be retyped/re-pasted every visit. Stored under the
+// page's own origin in localStorage, so it survives reloads and browser
+// restarts but never leaves the browser (no server, no account, nothing
+// synced) — clearing site data or using a different browser/device starts
+// a fresh list.
+const RECENT_SOURCES_KEY = 'tv3d.recentSources.v1';
+const MAX_RECENT_SOURCES = 8;
+const recentSourcesList = document.getElementById('recentSourcesList');
+const clearRecentBtn = document.getElementById('clearRecentBtn');
+
+function readRecentSources(){
+  try {
+    const list = JSON.parse(localStorage.getItem(RECENT_SOURCES_KEY) || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch (err){
+    // Private/incognito windows and some locked-down settings can make
+    // localStorage throw rather than just fail quietly — treat that the
+    // same as "no history yet" instead of breaking the page over it.
+    return [];
+  }
+}
+
+function writeRecentSources(list){
+  try {
+    localStorage.setItem(RECENT_SOURCES_KEY, JSON.stringify(list));
+  } catch (err){
+    console.warn('Could not save recent sources (localStorage unavailable or full):', err);
+  }
+}
+
+// Short display label for a (possibly very long) URL — host + path, no
+// query string, so an Xtream-Codes-style link with an embedded username/
+// password doesn't get plastered across the panel in full.
+function shortSourceLabel(url){
+  try {
+    const u = new URL(url);
+    return u.hostname + (u.pathname !== '/' ? u.pathname : '');
+  } catch {
+    return url;
+  }
+}
+
+function renderRecentSources(){
+  const list = readRecentSources();
+  recentSourcesList.parentElement.style.display = list.length ? 'block' : 'none';
+  recentSourcesList.innerHTML = '';
+  for (const url of list){
+    const row = document.createElement('div');
+    row.className = 'recentItem';
+    row.title = url;
+
+    const label = document.createElement('span');
+    label.className = 'recentLabel';
+    label.textContent = shortSourceLabel(url);
+    row.appendChild(label);
+
+    const remove = document.createElement('span');
+    remove.className = 'recentRemove';
+    remove.textContent = '✕';
+    remove.title = 'Remove from recent';
+    remove.addEventListener('click', (e) => {
+      e.stopPropagation(); // don't also trigger the row's own click-to-load
+      writeRecentSources(readRecentSources().filter((u) => u !== url));
+      renderRecentSources();
+    });
+    row.appendChild(remove);
+
+    row.addEventListener('click', () => {
+      streamUrlInput.value = url;
+      loadStreamUrl(url);
+    });
+    recentSourcesList.appendChild(row);
+  }
+}
+
+// Called from loadStreamUrl() whenever a link is submitted — remembered up
+// front rather than only on confirmed success, same as a browser's own
+// address-bar history, since even a channel-list link that fails once
+// (dead server, temporary CORS hiccup) is usually still worth keeping
+// around to retry later.
+function rememberRecentSource(url){
+  const list = readRecentSources().filter((u) => u !== url);
+  list.unshift(url);
+  writeRecentSources(list.slice(0, MAX_RECENT_SOURCES));
+  renderRecentSources();
+}
+
+clearRecentBtn.addEventListener('click', () => {
+  writeRecentSources([]);
+  renderRecentSources();
+});
+
+renderRecentSources(); // show whatever's left over from a previous visit
+
+// ---- Android: TV-only mode, no way back to the rest of the world ----
+// On Android specifically (not iOS, not desktop), skip free-roam entirely —
+// start already zoomed into the TV, and disable every path that would
+// normally leave that view (Escape, clicking/tapping off the TV). Touch pan
+// (one finger) and pinch-zoom (two fingers) still work since tvControls
+// already supports touch — see tvControls.touches above — so it's still a
+// usable little viewer, just permanently framed on the TV instead of the
+// room around it. (ANDROID_TV_LOCKED itself is detected up top, before any
+// model loads, so the house loader further up can skip fetching entirely.)
+if (ANDROID_TV_LOCKED){
+  mode = 'tv';
+  camera.position.set(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ + savedTVCamera.distance);
+  tvControls.target.set(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ);
+  camera.lookAt(tvControls.target);
+  tvControls.enabled = true;
+  tvControls.update();
+  crosshairEl.style.display = 'none';
+  streamPanel.style.display = 'block';
+  // The on-screen movement joystick is free-roam-only — there's no walking
+  // around to do here, so it'd just sit on screen doing nothing. The CSS
+  // rule that shows it for any touch device (body.touch-device) would
+  // otherwise still apply; this inline style overrides that.
+  const joystickZoneEl = document.getElementById('joystickZone');
+  if (joystickZoneEl) joystickZoneEl.style.display = 'none';
+}
+
+// ---- CRT-fallback mode ----
+// The CRT effect needs pixel access to the video (drawImage'd onto a canvas,
+// then uploaded to WebGL for the shader) — which needs the video loaded with
+// crossOrigin="anonymous" AND the source server actually sending back CORS
+// headers. Plenty of direct-file hosts don't, so if a URL fails with
+// crossOrigin set, we retry it without crossOrigin — no pixel/canvas access
+// then, but at least normal playback isn't blocked, since that never needed
+// CORS in the first place. When that's the situation, skip the CRT pipeline
+// entirely and just show the raw <video> element directly instead.
+let crtFallbackActive = false;
+
+function setCrtFallback(active){
+  crtFallbackActive = active;
+  if (active){
+    vid.style.display = 'block';
+    vid.style.position = 'fixed';
+    vid.style.right = '16px';
+    vid.style.bottom = '16px';
+    vid.style.width = '360px';
+    vid.style.maxWidth = '40vw';
+    vid.style.zIndex = '20';
+    vid.style.background = '#000';
+    vid.style.border = '2px solid rgba(255,255,255,0.35)';
+    vid.style.borderRadius = '6px';
+    vid.controls = true;
+  } else {
+    vid.style.display = 'none';
+    vid.removeAttribute('controls');
+  }
+}
+
 // ---- Loading a user-supplied link onto the TV ----
 // Direct video files (.mp4, .webm, etc.) just get set as the <video> src.
 // Genuine HLS streams (.m3u8 media/master playlists for ONE video) go
@@ -1045,26 +1255,114 @@ function parseChannelList(text){
   return channels.length > 1 ? channels : null;
 }
 
-// Plays a single media URL on the <video> element — either a direct file
-// (.mp4/.webm/etc.) or a genuine HLS stream (native on Safari, hls.js
-// elsewhere). This is the shared bottom layer for both loadStreamUrl()
-// (first load) and tuneToChannel() (Up/Down switching within a loaded list).
-async function playMediaUrl(url){
+// ---- Proxying an entire HLS stream, not just its first request ----
+//
+// A CORS proxy that just swaps in a different URL (proxied(), defined
+// alongside CORS_PROXIES below) is enough for a single direct file (.mp4
+// etc.) — there's only ever one request. A genuine .m3u8 stream is a *tree*
+// of requests instead: master playlist -> one or more variant/media
+// playlists -> individual segments, plus occasional #EXT-X-KEY / #EXT-X-MAP
+// URIs for encryption keys and init segments. hls.js resolves every URI it
+// finds *inside* a playlist against wherever that playlist actually came
+// from — and once a plain passthrough proxy has answered that fetch,
+// "wherever it came from" (as far as the browser is concerned) is the
+// proxy's own URL, not the real stream host. So any segment/sub-playlist
+// path that's *relative* in the manifest resolves against the proxy instead
+// of the origin and breaks — which is exactly how a stream can "work" for a
+// moment (whatever *did* load correctly) and then fall back once something
+// deeper in the tree comes back wrong, missing, or CORS-tainted.
+//
+// Fix: give hls.js a loader that (a) proxies every request it makes, not
+// just the first, and (b) whenever a response looks like a playlist, first
+// rewrites every URI reference inside it into an absolute, already-proxied
+// URL — resolved against the *real* URL that playlist was fetched from
+// (which this loader always knows, since it's the one doing the proxying).
+// That way hls.js never has to guess a base to resolve against for the next
+// request; everything it sees is already a complete, directly-fetchable
+// link back through the same proxy. This cascades naturally through
+// master -> variant playlist -> segments, since each is itself fetched
+// through this same loader in turn.
+
+function looksLikePlaylistText(text){
+  return typeof text === 'string' && /^\s*#EXTM3U/.test(text);
+}
+
+// Rewrites every URI in a playlist — plain lines (segments, nested
+// playlists) and `URI="..."` attributes (#EXT-X-KEY, #EXT-X-MAP, etc.) —
+// into an absolute URL (resolved against `base`, the real unproxied URL
+// this playlist came from) wrapped in the same proxy.
+function rewritePlaylistUrls(text, base, prefix){
+  const toProxied = (uri) => {
+    try {
+      return proxied(prefix, new URL(uri, base).href);
+    } catch {
+      return uri; // malformed URI — leave it alone rather than break playback
+    }
+  };
+  return text.split(/\r?\n/).map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return line;
+    if (trimmed.startsWith('#')){
+      return line.replace(/URI="([^"]+)"/, (_m, uri) => `URI="${toProxied(uri)}"`);
+    }
+    return toProxied(trimmed);
+  }).join('\n');
+}
+
+// Builds an hls.js loader class bound to one proxy prefix. Manifest, level/
+// variant playlists, audio/subtitle tracks, keys, and fragments all share
+// this one `loader` slot (hls.js only splits fLoader/pLoader out separately
+// if you configure those too, which we don't), so binding it once here
+// covers every request type in the tree.
+function makeHlsProxyLoader(BaseLoader, prefix){
+  return class ProxyAwareLoader extends BaseLoader {
+    load(context, config, callbacks){
+      // context.url might already be one of ours (e.g. a variant playlist
+      // URL we ourselves rewrote a moment ago) — unwrap back to the real
+      // URL first so we always know the true base, then re-wrap once.
+      const realUrl = context.url.startsWith(prefix)
+        ? decodeURIComponent(context.url.slice(prefix.length))
+        : context.url;
+      context.url = proxied(prefix, realUrl);
+
+      const onSuccess = callbacks.onSuccess;
+      callbacks.onSuccess = (response, stats, ctx, networkDetails) => {
+        if (looksLikePlaylistText(response.data)){
+          response = { ...response, data: rewritePlaylistUrls(response.data, realUrl, prefix) };
+        }
+        onSuccess(response, stats, ctx, networkDetails);
+      };
+      super.load(context, config, callbacks);
+    }
+  };
+}
+
+// Does the actual work of getting a URL playing on the <video> element —
+// either a direct file (.mp4/.webm/etc.) or a genuine HLS stream (native on
+// Safari, hls.js elsewhere). Shared by every attempt in playMediaUrl() below
+// (first unproxied, then once per CORS_PROXIES entry, then unproxied again
+// as a last resort) so the branching logic only has to live in one place.
+// `prefix` is '' for an unproxied attempt, or one of CORS_PROXIES' entries.
+// Proxying happens in here now, rather than playMediaUrl swapping the URL
+// beforehand, because HLS needs more than a single URL swap (see above).
+async function loadIntoVideoElement(realUrl, prefix){
   if (hls){ hls.destroy(); hls = null; }
   vid.pause();
   vid.removeAttribute('src');
   vid.load();
 
-  if (looksLikeM3U(url)){
+  if (looksLikeM3U(realUrl)){
     if (vid.canPlayType('application/vnd.apple.mpegurl')){
-      // Native HLS support (Safari) — no library needed.
-      vid.src = url;
+      // Native HLS support (Safari) — no hls.js, so no way to intercept the
+      // sub-requests it makes internally. A proxy here only ever covers the
+      // top-level manifest fetch, same limitation as before this change.
+      vid.src = prefix ? proxied(prefix, realUrl) : realUrl;
       await vid.play();
     } else {
       const { default: Hls } = await import('https://cdn.jsdelivr.net/npm/hls.js@1/+esm');
       if (!Hls.isSupported()) throw new Error('HLS not supported in this browser');
-      hls = new Hls();
-      hls.loadSource(url);
+      hls = new Hls(prefix ? { loader: makeHlsProxyLoader(Hls.DefaultConfig.loader, prefix) } : {});
+      hls.loadSource(realUrl);
       hls.attachMedia(vid);
       await new Promise((resolve, reject) => {
         hls.on(Hls.Events.MANIFEST_PARSED, resolve);
@@ -1073,10 +1371,70 @@ async function playMediaUrl(url){
       await vid.play();
     }
   } else {
-    // Anything else — .mp4, .webm, etc. — is just a normal video src.
-    vid.src = url;
+    // Anything else — .mp4, .webm, etc. — is just a normal video src, so
+    // the original single-URL-swap trick is all a proxy needs to do here.
+    vid.src = prefix ? proxied(prefix, realUrl) : realUrl;
     await vid.play();
   }
+}
+
+// Plays a single media URL — this is the shared bottom layer for both
+// loadStreamUrl() (first load) and tuneToChannel() (Up/Down switching within
+// a loaded list). Always tries with CORS requested first (needed for the CRT
+// effect); if that fails — a lot of direct-file hosts don't send CORS
+// headers at all — retries once without it and, if that works, falls back to
+// showing the raw video directly instead of the CRT-processed one.
+// CORS proxies, tried in order — each re-fetches the URL and re-serves it
+// with permissive CORS headers, so a host that never intended to support
+// cross-origin canvas/WebGL access effectively does anyway. For a direct
+// file (.mp4/.webm/etc.) that's a single URL swap. For genuine HLS (.m3u8)
+// streams it's more involved — hls.js's manifest tree needs every request
+// proxied, plus rewritten URIs so relative segment paths resolve against
+// the real host instead of the proxy — see the loader built in
+// loadIntoVideoElement() above (makeHlsProxyLoader) for how that's handled.
+//
+// First slot is your own Cloudflare Worker (see the worker code + deploy
+// steps you were given alongside this) — reliable, not shared/rate-limited/
+// blacklisted the way a public proxy can be, so it's worth putting first
+// once it's deployed. Paste its URL in below; leave '' to skip it. The rest
+// are public fallbacks — free, no setup, but occasionally blocked by a given
+// host or proxy itself (as with corsproxy.io + hypnohub returning a 403),
+// which is exactly why there's more than one.
+const CORS_PROXIES = [
+  'https://broken-paper-d384.kcmegalonio.workers.dev/?url=',
+  'https://corsproxy.io/?url=',
+  'https://api.allorigins.win/raw?url=',
+].filter(Boolean);
+
+function proxied(prefix, url){
+  return prefix + encodeURIComponent(url);
+}
+
+async function playMediaUrl(url){
+  vid.setAttribute('crossorigin', 'anonymous');
+
+  try {
+    await loadIntoVideoElement(url, '');
+    setCrtFallback(false);
+    return;
+  } catch (err){
+    console.warn('Direct playback with CORS requested failed; trying CORS proxies next:', err);
+  }
+
+  for (const prefix of CORS_PROXIES){
+    try {
+      await loadIntoVideoElement(url, prefix);
+      setCrtFallback(false);
+      return;
+    } catch (err){
+      console.warn(`CORS proxy (${prefix}) failed too, trying the next one:`, err);
+    }
+  }
+
+  console.warn('All CORS proxies failed; falling back to direct playback without CORS (skips the CRT effect for this source).');
+  vid.removeAttribute('crossorigin');
+  await loadIntoVideoElement(url, ''); // last resort — let this one throw normally if it also fails
+  setCrtFallback(true);
 }
 
 async function tuneToChannel(index){
@@ -1086,7 +1444,7 @@ async function tuneToChannel(index){
   streamStatus.textContent = 'Loading ' + ch.name + '…';
   try {
     await playMediaUrl(ch.url);
-    streamStatus.textContent = 'Playing: ' + ch.name;
+    streamStatus.textContent = 'Playing: ' + ch.name + (crtFallbackActive ? ' (no CRT effect — source doesn\'t support it)' : '');
   } catch (err){
     console.error('Failed to tune channel:', ch.name, err);
     streamStatus.textContent = 'Couldn\'t load "' + ch.name + '"';
@@ -1106,6 +1464,7 @@ function changeChannelBy(delta){
 async function loadStreamUrl(url){
   url = url.trim();
   if (!url) return;
+  rememberRecentSource(url);
   streamStatus.textContent = 'Loading…';
   flashStatic(350);
   channelList = null;
@@ -1133,7 +1492,7 @@ async function loadStreamUrl(url){
 
   try {
     await playMediaUrl(url);
-    streamStatus.textContent = 'Playing';
+    streamStatus.textContent = 'Playing' + (crtFallbackActive ? ' (no CRT effect — source doesn\'t support it)' : '');
   } catch (err){
     console.error('Failed to load stream:', err);
     streamStatus.textContent = 'Couldn\'t load that link';
@@ -1144,59 +1503,6 @@ document.getElementById('streamLoadBtn').addEventListener('click', () => loadStr
 streamUrlInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') loadStreamUrl(streamUrlInput.value);
 });
-
-// ---- Default channel on page load ----
-// Nobody's pasted a link yet, so grab a random channel from this public
-// IPTV list to start. Genuinely random each visit — nothing is remembered
-// between sessions, so coming back to the site can easily land on a
-// different channel. These free lists always have some dead/geo-blocked
-// entries, so we shuffle the whole channel list once and try each in that
-// order until one actually plays, rather than giving up after the first
-// failure.
-const DEFAULT_PLAYLIST_URL = 'https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8';
-
-function shuffled(arr){
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--){
-    const j = (Math.random() * (i + 1)) | 0;
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
-async function loadDefaultChannelRandomly(){
-  streamStatus.textContent = 'Loading…';
-  let parsed;
-  try {
-    const res = await fetch(DEFAULT_PLAYLIST_URL);
-    const text = await res.text();
-    parsed = parseChannelList(text);
-  } catch (err){
-    console.error('Could not fetch default playlist:', err);
-    streamStatus.textContent = 'Could not load default playlist';
-    return;
-  }
-  if (!parsed || parsed.length === 0){
-    streamStatus.textContent = 'Default playlist had no channels';
-    return;
-  }
-  channelList = parsed;
-  for (const idx of shuffled(parsed.map((_, i) => i))){
-    const ch = parsed[idx];
-    streamStatus.textContent = 'Loading ' + ch.name + '…';
-    try {
-      await playMediaUrl(ch.url);
-      channelIndex = idx;
-      channelShownAt = performance.now();
-      streamStatus.textContent = 'Playing: ' + ch.name;
-      return;
-    } catch (err){
-      console.warn('Default channel failed, trying another:', ch.name, err);
-    }
-  }
-  streamStatus.textContent = 'Could not find a working channel in the default playlist';
-}
-loadDefaultChannelRandomly();
 
 // While sat at the TV, Up/Down (plus W/S, and Z since AZERTY swaps W<->Z)
 // step through a loaded channel list. Clicking the screen (surfChannel(),
@@ -1539,22 +1845,141 @@ tvLoader.load('TV.glb', (gltf) => {
     setupScreenGlow(screenMesh);
   }
 
-  savedTVCamera.height = 17.5;
-  savedTVCamera.distance = 55;
-  savedTVCamera.targetX = TV_POSITION.x;
-  savedTVCamera.targetZ = TV_POSITION.z;
-
   document.getElementById('loading').style.display = 'none';
 }, undefined, (err) => {
   console.error('Error loading TV.glb:', err);
   document.getElementById('loading').textContent = 'Failed to load TV model — check console.';
 });
 
+// ---- Arcade cabinet: disabled for now ----
+// Turned out the screen-as-video-player idea needed real reverse-engineering
+// (its screen isn't a separate mesh/material like the TV's — see the comment
+// below) with no way to confirm the result without live visual feedback.
+// Not worth it right now, so the whole cabinet (spawn, screen patch, hover
+// outline setup) is commented out below rather than deleted, in case it's
+// worth revisiting later.
+/*
+// ---- Arcade cabinet screen ----
+// This model's screen isn't its own mesh/material the way the TV's is — the
+// whole cabinet (body, bezel, screen, everything) is one continuous surface
+// sharing one texture atlas, with the screen artwork just baked into one
+// small rectangle of it. So instead of swapping a material, we clone that
+// atlas's baseColor + emissive images onto our own canvases once, and every
+// frame redraw just that rectangle with the live CRT feed — the rest of the
+// cabinet's art stays exactly as exported.
+//
+// That rectangle's UV mapping runs rotated relative to the cabinet's actual
+// physical axes (found by tracing which vertices share that part of the
+// atlas) — a normal side effect of how the unwrap was packed, not something
+// we can just read off the model. So the video patch needs a matching
+// rotation/flip to land right-side-up, and there's no way to derive that
+// blind — press C to cycle rotation in 90° steps, V to flip horizontally,
+// X to flip vertically, and check how it looks. The HUD shows the current
+// combination; once it's right, report the values back to get them
+// hardcoded as the default.
+const ARCADE_SCREEN_UV = { u0: 0.7218, u1: 0.7926, v0: 0.6077, v1: 0.8260 };
+let arcadeScreenRotation = 0; // degrees: 0, 90, 180, or 270
+let arcadeScreenFlipH = false;
+let arcadeScreenFlipV = false;
+
+let arcadeBaseColorCanvas = null, arcadeBaseColorCtx = null, arcadeBaseColorTexture = null;
+let arcadeEmissiveCanvas = null, arcadeEmissiveCtx = null, arcadeEmissiveTexture = null;
+
+function setupArcadeScreen(cabinetMesh){
+  const mat = cabinetMesh.material;
+  const baseImg = mat.map ? mat.map.image : null;
+  const emisImg = mat.emissiveMap ? mat.emissiveMap.image : null;
+  if (!baseImg || !emisImg){
+    console.warn('Arcade cabinet material is missing its baseColor/emissive textures — screen patch skipped.');
+    return;
+  }
+
+  arcadeBaseColorCanvas = document.createElement('canvas');
+  arcadeBaseColorCanvas.width = baseImg.width;
+  arcadeBaseColorCanvas.height = baseImg.height;
+  arcadeBaseColorCtx = arcadeBaseColorCanvas.getContext('2d');
+  arcadeBaseColorCtx.drawImage(baseImg, 0, 0);
+
+  arcadeEmissiveCanvas = document.createElement('canvas');
+  arcadeEmissiveCanvas.width = emisImg.width;
+  arcadeEmissiveCanvas.height = emisImg.height;
+  arcadeEmissiveCtx = arcadeEmissiveCanvas.getContext('2d');
+  arcadeEmissiveCtx.drawImage(emisImg, 0, 0);
+
+  arcadeBaseColorTexture = new THREE.CanvasTexture(arcadeBaseColorCanvas);
+  arcadeBaseColorTexture.colorSpace = THREE.SRGBColorSpace;
+  arcadeBaseColorTexture.flipY = false; // match how GLTFLoader loaded the original (see the TV's screenTexture.flipY fix above for why)
+  arcadeBaseColorTexture.minFilter = THREE.LinearFilter;
+  arcadeBaseColorTexture.magFilter = THREE.LinearFilter;
+
+  arcadeEmissiveTexture = new THREE.CanvasTexture(arcadeEmissiveCanvas);
+  arcadeEmissiveTexture.colorSpace = THREE.SRGBColorSpace;
+  arcadeEmissiveTexture.flipY = false;
+  arcadeEmissiveTexture.minFilter = THREE.LinearFilter;
+  arcadeEmissiveTexture.magFilter = THREE.LinearFilter;
+
+  mat.map = arcadeBaseColorTexture;
+  mat.emissiveMap = arcadeEmissiveTexture;
+  mat.needsUpdate = true;
+}
+
+function drawArcadeScreenPatch(){
+  if (!arcadeBaseColorCtx || !arcadeEmissiveCtx) return;
+
+  const drawInto = (ctx, w, h, blackout) => {
+    const x0 = ARCADE_SCREEN_UV.u0 * w;
+    const x1 = ARCADE_SCREEN_UV.u1 * w;
+    const y0 = ARCADE_SCREEN_UV.v0 * h;
+    const y1 = ARCADE_SCREEN_UV.v1 * h;
+    const pw = x1 - x0, ph = y1 - y0;
+
+    ctx.save();
+    ctx.translate(x0 + pw / 2, y0 + ph / 2);
+    ctx.rotate(arcadeScreenRotation * Math.PI / 180);
+    ctx.scale(arcadeScreenFlipH ? -1 : 1, arcadeScreenFlipV ? -1 : 1);
+    // A 90/270 rotation swaps which patch dimension the video's width vs
+    // height land on — swap dw/dh to match so the picture isn't stretched.
+    const rotated90 = (arcadeScreenRotation % 180) !== 0;
+    const dw = rotated90 ? ph : pw;
+    const dh = rotated90 ? pw : ph;
+    if (blackout){
+      ctx.fillStyle = '#000';
+      ctx.fillRect(-dw / 2, -dh / 2, dw, dh);
+    } else {
+      ctx.drawImage(paddedCanvas, -dw / 2, -dh / 2, dw, dh);
+    }
+    ctx.restore();
+  };
+
+  // Base color gets blacked out under the patch (like the TV glass's black
+  // base) so the video doesn't ghost against the cabinet's original baked
+  // screenshot artwork; emissive gets the actual live picture.
+  drawInto(arcadeBaseColorCtx, arcadeBaseColorCanvas.width, arcadeBaseColorCanvas.height, true);
+  drawInto(arcadeEmissiveCtx, arcadeEmissiveCanvas.width, arcadeEmissiveCanvas.height, false);
+
+  arcadeBaseColorTexture.needsUpdate = true;
+  arcadeEmissiveTexture.needsUpdate = true;
+}
+
+function onArcadeScreenOrientKeyDown(e){
+  switch (e.code){
+    case 'KeyC': arcadeScreenRotation = (arcadeScreenRotation + 90) % 360; break;
+    case 'KeyV': arcadeScreenFlipH = !arcadeScreenFlipH; break;
+    case 'KeyX': arcadeScreenFlipV = !arcadeScreenFlipV; break;
+    default: return;
+  }
+  camHud.style.display = '';
+  camHud.textContent = `arcade screen orient — rotation: ${arcadeScreenRotation}  flipH: ${arcadeScreenFlipH}  flipV: ${arcadeScreenFlipV}\n(C: rotate 90°, V: flip horizontal, X: flip vertical)`;
+}
+document.addEventListener('keydown', onArcadeScreenOrientKeyDown);
+
 // ---- Arcade cabinet, loaded from Arcade.glb ----
-// A static, self-contained decorative piece — same centering/scaling
-// treatment as the TV, registered as both collidable (can't walk through
-// it) and placeable (nudge-able with P same as the TV). No click-to-sit or
-// screen texture — it's just furniture for now.
+// Same centering/scaling treatment as the TV, registered as both collidable
+// (can't walk through it) and placeable (nudge-able with P same as the TV).
+// It now also plays the same live feed as the TV — see setupArcadeScreen /
+// drawArcadeScreenPatch below for how, since unlike the TV this screen isn't
+// a separate mesh/material we can just swap. No click-to-sit — it's not a
+// dedicated viewing spot, just a second place to catch the same broadcast.
 const ARCADE_TARGET_SIZE = 70; // a guess at a sensible cabinet height relative to the TV's 40; nudge/rescale once you see it in place
 const arcadeLoader = new GLTFLoader();
 arcadeLoader.load('Arcade.glb', (gltf) => {
@@ -1576,6 +2001,15 @@ arcadeLoader.load('Arcade.glb', (gltf) => {
 
   arcadeModel = model;
 
+  // The screen isn't a separate mesh/material like the TV's — it's a small
+  // rectangle of a single continuous cabinet mesh/atlas ("cbnit"). Find that
+  // mesh and set up the live video patch on it.
+  model.traverse((child) => {
+    if (child.isMesh && child.material && child.material.name === 'cbnit'){
+      setupArcadeScreen(child);
+    }
+  });
+
   // Hover feedback, same "inverted hull" trick as the TV: a cloned copy
   // rendered with the outline shader, toggled on/off based on where the
   // cursor/crosshair is pointing.
@@ -1589,6 +2023,7 @@ arcadeLoader.load('Arcade.glb', (gltf) => {
 }, undefined, (err) => {
   console.error('Error loading Arcade.glb:', err);
 });
+*/
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
@@ -1668,7 +2103,7 @@ function onPointerUp(e){
   if (mode === 'tv'){
     const tvHits = raycastFromClient(e.clientX, e.clientY, tvModel);
     if (tvHits.length === 0){
-      exitTVMode();
+      if (!ANDROID_TV_LOCKED) exitTVMode();
       return;
     }
     if (screenMesh && tvHits.some(h => h.object === screenMesh)){
@@ -1704,11 +2139,14 @@ window.addEventListener('resize', () => {
 function animate() {
   const delta = clock.getDelta();
 
-  drawCRTFrame();
-  updateOverscanAdjust(delta);
-  drawPaddedFrame();
-  screenTexture.needsUpdate = true;
-  updateScreenGlow();
+  if (!crtFallbackActive){
+    drawCRTFrame();
+    updateOverscanAdjust(delta);
+    drawPaddedFrame();
+    // drawArcadeScreenPatch(); // arcade cabinet is disabled for now, see comment block above its loader
+    screenTexture.needsUpdate = true;
+    updateScreenGlow();
+  }
   if (tvOutlineMesh && tvModel){
     tvOutlineMesh.position.copy(tvModel.position);
     tvOutlineMesh.rotation.copy(tvModel.rotation);
