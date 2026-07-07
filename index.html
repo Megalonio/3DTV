@@ -1694,7 +1694,8 @@ function onPointerUp(e){
       return;
     }
     if (screenMesh && tvHits.some(h => h.object === screenMesh)){
-      surfChannel();
+      if (channelList) changeChannelBy(1);
+      else surfChannel();
     }
     return;
   }
