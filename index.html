@@ -27,22 +27,51 @@
     color:#fff; font-family:sans-serif; font-size:16px; background:#111; z-index:10;
   }
   #srcCanvas, #crtCanvas { display:none; }
-  #streamPanel {
-    position:absolute; top:50%; right:4%; transform:translateY(-50%);
-    z-index:6; width:230px; font-family:sans-serif; color:#eee;
-    background:rgba(15,15,15,0.72); border:1px solid #555; border-radius:10px;
-    padding:14px 16px; display:none; backdrop-filter: blur(2px);
+  /* Stream drawer: hidden off-screen above the viewport by default, slides
+     down over the TV view when opened (tap the handle, or on touch, swipe
+     down from the top edge). Swipe up / tap the backdrop / Esc closes it.
+     Kept full-width so it works the same on phones and desktop. */
+  #streamHandle {
+    position:fixed; top:0; left:50%; transform:translateX(-50%);
+    z-index:7; display:none; align-items:center; gap:6px;
+    font-family:sans-serif; font-size:11px; color:#ccc; letter-spacing:0.03em;
+    background:rgba(20,20,20,0.85); border:1px solid #555; border-top:none;
+    border-radius:0 0 10px 10px; padding:6px 16px 7px; cursor:pointer;
+    backdrop-filter: blur(2px); user-select:none; -webkit-tap-highlight-color: transparent;
   }
+  #streamHandle .chevron { transition: transform 0.25s ease; opacity:0.8; }
+  #streamHandle.open .chevron { transform: rotate(180deg); }
+  #streamBackdrop {
+    position:fixed; inset:0; z-index:5; background:rgba(0,0,0,0.5);
+    opacity:0; pointer-events:none; transition: opacity 0.25s ease;
+  }
+  #streamBackdrop.open { opacity:1; pointer-events:auto; }
+  #streamPanel {
+    position:fixed; top:0; left:0; right:0; z-index:6;
+    max-height:85vh; overflow-y:auto; box-sizing:border-box;
+    font-family:sans-serif; color:#eee;
+    background:rgba(15,15,15,0.92); border-bottom:1px solid #555;
+    border-radius:0 0 14px 14px; padding:34px 20px 20px;
+    backdrop-filter: blur(4px);
+    transform:translateY(-100%); transition: transform 0.3s ease;
+  }
+  #streamPanel.open { transform:translateY(0); }
+  #streamPanelInner { max-width:420px; margin:0 auto; }
+  #streamCloseBtn {
+    position:absolute; top:8px; right:14px; font-size:20px; line-height:1;
+    color:#ccc; opacity:0.7; cursor:pointer; padding:6px; margin:-6px;
+  }
+  #streamCloseBtn:hover { opacity:1; }
   #streamPanel label {
-    display:block; font-size:11px; opacity:0.75; margin-bottom:8px; line-height:1.4;
+    display:block; font-size:12px; opacity:0.75; margin-bottom:10px; line-height:1.4;
   }
   #streamPanel input {
-    width:100%; box-sizing:border-box; padding:7px 8px; border-radius:5px;
-    border:1px solid #666; background:#111; color:#eee; font-size:12px;
+    width:100%; box-sizing:border-box; padding:9px 10px; border-radius:5px;
+    border:1px solid #666; background:#111; color:#eee; font-size:13px;
   }
   #streamPanel button {
-    margin-top:8px; width:100%; padding:7px; border-radius:5px; border:1px solid #666;
-    background:#242424; color:#eee; cursor:pointer; font-size:12px;
+    margin-top:8px; width:100%; padding:9px; border-radius:5px; border:1px solid #666;
+    background:#242424; color:#eee; cursor:pointer; font-size:13px;
   }
   #streamPanel button:hover { background:#333; }
   #streamStatus { margin-top:7px; font-size:11px; opacity:0.75; min-height:14px; }
@@ -54,11 +83,11 @@
   }
   #clearRecentBtn { cursor:pointer; text-decoration:underline; opacity:0.85; }
   #clearRecentBtn:hover { opacity:1; }
-  #recentSourcesList { max-height:120px; overflow-y:auto; }
+  #recentSourcesList { max-height:160px; overflow-y:auto; }
   .recentItem {
-    display:flex; align-items:center; gap:6px; padding:5px 7px;
+    display:flex; align-items:center; gap:6px; padding:7px 8px;
     margin-bottom:4px; border-radius:5px; background:rgba(255,255,255,0.06);
-    cursor:pointer; font-size:11px;
+    cursor:pointer; font-size:12px;
   }
   .recentItem:hover { background:rgba(255,255,255,0.16); }
   .recentItem .recentLabel {
@@ -74,19 +103,25 @@
 <div id="container"></div>
 <div id="loading">Loading model…</div>
 
+<div id="streamBackdrop"></div>
+<div id="streamHandle"><span class="chevron">▾</span><span>Stream</span></div>
 <div id="streamPanel">
-  <label for="streamUrlInput">Play a link on the TV — .m3u/.m3u8 stream, an IPTV channel list, or a direct .mp4. Up/Down switches channels if a list loads.</label>
-  <input id="streamUrlInput" type="text" placeholder="https://example.com/video.mp4" autocomplete="off">
-  <button id="streamLoadBtn">Play</button>
-  <div id="streamStatus"></div>
-  <div id="recentSources">
-    <div id="recentSourcesHead">
-      <span>Recent</span>
-      <span id="clearRecentBtn">clear</span>
+  <div id="streamCloseBtn" title="Close">✕</div>
+  <div id="streamPanelInner">
+    <label for="streamUrlInput">Play a link on the TV — .m3u/.m3u8 stream, an IPTV channel list, or a direct .mp4. Up/Down switches channels if a list loads.</label>
+    <input id="streamUrlInput" type="text" placeholder="https://example.com/video.mp4" autocomplete="off">
+    <button id="streamLoadBtn">Play</button>
+    <div id="streamStatus"></div>
+    <div id="recentSources">
+      <div id="recentSourcesHead">
+        <span>Recent</span>
+        <span id="clearRecentBtn">clear</span>
+      </div>
+      <div id="recentSourcesList"></div>
     </div>
-    <div id="recentSourcesList"></div>
   </div>
 </div>
+
 
 <canvas id="srcCanvas" width="256" height="240"></canvas>
 <canvas id="crtCanvas" width="512" height="480"></canvas>
@@ -652,7 +687,12 @@ function onKeyDown(e){
     case 'KeyD': case 'ArrowRight': moveState.right = true; break;
     case 'Space': moveState.up = true; break;
     case 'ShiftLeft': case 'ShiftRight': moveState.down = true; break;
-    case 'Escape': if (mode === 'tv') exitTVMode(); break;
+    case 'Escape':
+      if (mode === 'tv'){
+        if (streamPanel.classList.contains('open')) closeStreamMenu();
+        else exitTVMode();
+      }
+      break;
     case 'KeyC':
       isoPanOffset.copy(TV_POSITION).sub(ISO_TARGET);
       isoZoom = ISO_ZOOM_MIN;
@@ -845,8 +885,68 @@ camHud.style.cssText = 'position:absolute;bottom:16px;left:16px;z-index:5;color:
 document.body.appendChild(camHud);
 
 const streamPanel = document.getElementById('streamPanel');
+const streamHandle = document.getElementById('streamHandle');
+const streamBackdrop = document.getElementById('streamBackdrop');
+const streamCloseBtn = document.getElementById('streamCloseBtn');
 const streamUrlInput = document.getElementById('streamUrlInput');
 const streamStatus = document.getElementById('streamStatus');
+
+// The drawer starts closed every time you step up to the TV — tap/swipe
+// down on the handle to reveal it, tap the backdrop, swipe up, hit ✕, or
+// press Esc to put it away again.
+function openStreamMenu(){
+  streamPanel.classList.add('open');
+  streamBackdrop.classList.add('open');
+  streamHandle.classList.add('open');
+}
+function closeStreamMenu(){
+  streamPanel.classList.remove('open');
+  streamBackdrop.classList.remove('open');
+  streamHandle.classList.remove('open');
+}
+function toggleStreamMenu(){
+  if (streamPanel.classList.contains('open')) closeStreamMenu();
+  else openStreamMenu();
+}
+streamHandle.addEventListener('click', toggleStreamMenu);
+streamBackdrop.addEventListener('click', closeStreamMenu);
+streamCloseBtn.addEventListener('click', closeStreamMenu);
+
+// Touch swipe: pull down from the top edge (or the handle) to open, swipe
+// up anywhere on the open drawer to close. No live drag-follow — just a
+// distance/direction check on release, the CSS transition handles the rest.
+const STREAM_EDGE_ZONE = 40;      // px from the top edge that counts as "the pull tab"
+const STREAM_SWIPE_THRESHOLD = 45; // px of vertical travel needed to trigger
+let streamTouchStartY = null;
+let streamTouchTrackable = false;
+
+function streamTouchStart(e){
+  if (mode !== 'tv'){ streamTouchTrackable = false; return; }
+  const t = e.touches[0];
+  const onHandle = e.target.closest && e.target.closest('#streamHandle');
+  const onScrollableList = e.target.closest && e.target.closest('#recentSourcesList');
+  const isOpen = streamPanel.classList.contains('open');
+  if (!isOpen){
+    streamTouchTrackable = !!onHandle || t.clientY <= STREAM_EDGE_ZONE;
+  } else {
+    // Anywhere on the open drawer closes it on a swipe-up, except the
+    // recent-list's own scroll area so its scrolling isn't hijacked.
+    streamTouchTrackable = !onScrollableList;
+  }
+  streamTouchStartY = streamTouchTrackable ? t.clientY : null;
+}
+function streamTouchEnd(e){
+  if (!streamTouchTrackable || streamTouchStartY == null) return;
+  const t = e.changedTouches[0];
+  const deltaY = t.clientY - streamTouchStartY;
+  const isOpen = streamPanel.classList.contains('open');
+  if (!isOpen && deltaY > STREAM_SWIPE_THRESHOLD) openStreamMenu();
+  else if (isOpen && deltaY < -STREAM_SWIPE_THRESHOLD) closeStreamMenu();
+  streamTouchTrackable = false;
+  streamTouchStartY = null;
+}
+document.addEventListener('touchstart', streamTouchStart, { passive:true });
+document.addEventListener('touchend', streamTouchEnd, { passive:true });
 
 // Recently-loaded sources, stored in localStorage (client-only, no server).
 const RECENT_SOURCES_KEY = 'tv3d.recentSources.v1';
@@ -1245,7 +1345,8 @@ function startTransition(toPos, toQuat, finalMode, toViewSize){
   pendingMode = finalMode;
   mode = 'transitioning';
   tvControls.enabled = false;
-  streamPanel.style.display = 'none';
+  closeStreamMenu();
+  streamHandle.style.display = 'none';
 }
 
 function updateTransition(delta){
@@ -1268,7 +1369,7 @@ function finishTransition(){
     setOrthoFrustum(TV_ORTHO_VIEW_SIZE);
     tvControls.enabled = true;
     tvControls.update();
-    streamPanel.style.display = 'block';
+    streamHandle.style.display = 'flex';
   } else {
     mode = 'freeroam';
     setOrthoFrustum(ISO_ORTHO_VIEW_SIZE_BASE * isoZoom); // zoom is always 1 here, already true — just re-affirm precisely
