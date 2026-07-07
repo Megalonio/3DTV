@@ -1567,7 +1567,11 @@ renderer.domElement.addEventListener('pointermove', (e) => {
 
 function updateTVHoverOutline(){
   if (!tvModel || !tvOutlineMesh) return;
-  if (mode !== 'freeroam'){
+  // Touch devices have no real hover concept — pointermove only fires on an
+  // active touch, so lastMouseX/Y otherwise just sits at its screen-center
+  // default forever, which happens to land on the TV and lit the outline
+  // permanently. Skip hover entirely there; tap-to-zoom still works fine.
+  if (mode !== 'freeroam' || isTouchDevice){
     tvOutlineMesh.visible = false;
     return;
   }
