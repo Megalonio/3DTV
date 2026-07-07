@@ -56,36 +56,12 @@
   }
   .recentItem .recentRemove { opacity:0.5; flex-shrink:0; }
   .recentItem .recentRemove:hover { opacity:1; }
-
-  /* ---- Mobile on-screen joystick (movement) ---- */
-  #joystickZone {
-    position:absolute; left:20px; bottom:20px; width:130px; height:130px;
-    z-index:7; display:none; touch-action:none;
-  }
-  body.touch-device #joystickZone { display:block; }
-  #joystickBase {
-    position:absolute; inset:0; border-radius:50%;
-    background:rgba(255,255,255,0.08); border:2px solid rgba(255,255,255,0.28);
-  }
-  #joystickStick {
-    position:absolute; width:56px; height:56px; border-radius:50%;
-    background:rgba(255,255,255,0.35); border:2px solid rgba(255,255,255,0.55);
-    left:50%; top:50%; transform:translate(-50%,-50%);
-    touch-action:none;
-  }
 </style>
 </head>
 
 <body>
 <div id="container"></div>
 <div id="loading">Loading model…</div>
-<div id="crosshair" style="position:absolute;top:50%;left:50%;width:6px;height:6px;margin:-3px 0 0 -3px;border-radius:50%;background:rgba(255,255,255,0.8);pointer-events:none;z-index:5;"></div>
-
-<div id="joystickZone">
-  <div id="joystickBase">
-    <div id="joystickStick"></div>
-  </div>
-</div>
 
 <div id="streamPanel">
   <label for="streamUrlInput">Play a link on the TV — .m3u/.m3u8 stream, an IPTV channel list, or a direct .mp4. Up/Down switches channels if a list loads.</label>
@@ -117,7 +93,6 @@
 <script type="module">
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUniformsLib.js";
 
@@ -125,7 +100,7 @@ import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUnifo
 
 // Detected up front, before any model loads, so it can gate which assets
 // even get fetched (the house never needs to load at all on Android — see
-// the Duplex.glb loader below) as well as the camera/exit behavior further
+// the Room.glb loader below) as well as the camera/exit behavior further
 // down (see the "Android: TV-only mode" block).
 const ANDROID_TV_LOCKED = /Android/i.test(navigator.userAgent);
 
@@ -407,12 +382,11 @@ scene.background = new THREE.Color(0x1a1a1a);
 // Detected early (moved up from the touch-controls section below) so the
 // renderer can pick mobile-friendly settings from the start.
 const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
-if (isTouchDevice) document.body.classList.add('touch-device');
 
-// ---- 3D house the TV sits inside, loaded from Duplex.glb (next to
-// index.html — everything is now just index.html + Duplex.glb + TV.glb +
-// Arcade.glb, no separate textures/ folder; all three .glb files carry
-// their own textures embedded).
+// ---- 3D house the TV sits inside, loaded from Room.glb (next to
+// index.html — everything is now just index.html + Room.glb + TV.glb,
+// no separate textures/ folder; both .glb files carry their own textures
+// embedded).
 // The house's own units are almost certainly a different scale than the
 // arbitrary units the furniture is normalized to (targetSize below), so it
 // needs to be scaled up/down and have its floor lined up with everything
@@ -442,39 +416,6 @@ let TV_ROTATION_Y = 4.71;
 // placement mode, Tab to cycle to "Arcade") and nudged into its final spot.
 const ARCADE_POSITION = new THREE.Vector3(10, 15, -44);
 let ARCADE_ROTATION_Y = 1.57;
-
-// ---- Collision registry ----
-// Anything the free-roam camera should collide with (can't walk through,
-// stands on) gets pushed here once its model has loaded. Used by tryMove()/
-// applyFloorSnap() further down.
-const collidables = [];
-
-// Flat cache of every material belonging to a collidable mesh, so the two
-// functions below can flip .side for the instant of a raycast without a
-// full scene traverse every frame.
-const collidableMaterials = [];
-
-// Imported architectural meshes (like the house) are often modeled to be
-// seen only from inside a room, with normals/winding facing that way —
-// which means a collision raycast approaching a wall from "outside" can
-// miss it entirely (the raycaster culls backfaces the same way rendering
-// does). Rather than permanently rendering these materials double-sided
-// (which roughly doubles fragment/overdraw cost for the whole house —
-// a real cost on mobile GPUs), setCollidableSide() below flips them to
-// DoubleSide only for the duration of each raycast call, then straight
-// back to FrontSide for the actual frame render.
-function makeCollidable(object3D){
-  object3D.traverse((child) => {
-    if (!child.isMesh || !child.material) return;
-    const mats = Array.isArray(child.material) ? child.material : [child.material];
-    mats.forEach(m => collidableMaterials.push(m));
-  });
-  collidables.push(object3D);
-}
-
-function setCollidableSide(side){
-  for (let i = 0; i < collidableMaterials.length; i++) collidableMaterials[i].side = side;
-}
 
 // ---- Generic "placeable items" registry ----
 // Anything nudge-able in placement mode (TV, arcade cabinet, and anything
@@ -510,8 +451,8 @@ const houseLoader = new GLTFLoader();
 // Never visible in TV-locked mode (camera can't leave the TV, and can't
 // rotate to see anything beside it even before that), so skip the fetch
 // entirely on Android rather than downloading it for nothing.
-if (!ANDROID_TV_LOCKED){
-  houseLoader.load('Duplex.glb', (gltf) => {
+if (false){
+  houseLoader.load('Room.glb', (gltf) => {
     const house = gltf.scene;
 
     const box = new THREE.Box3().setFromObject(house);
@@ -528,17 +469,25 @@ if (!ANDROID_TV_LOCKED){
     );
 
     scene.add(house);
-    makeCollidable(house);
     console.log('House native size:', size, '-> scaled size:', size.clone().multiplyScalar(HOUSE_SCALE));
   }, undefined, (err) => {
-    console.error('Error loading Duplex.glb:', err);
+    console.error('Error loading Room.glb:', err);
   });
 }
 
 // TV Stand intentionally not loaded — skipping TVStand.glb entirely to save
 // on load time / GPU memory. Re-add a loader here if it's ever needed again.
 
-const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+// ---- Single orthographic camera, shared by every mode ----
+// Room view (freeroam/placement) and the TV close-up now use the SAME
+// camera object and the SAME orthographic projection — only its position,
+// orientation, and frustum size change between them. Swapping camera
+// *objects* (or projections) always reads as a visible snap the instant it
+// happens, even when position matches exactly, so we avoid that by keeping
+// one object throughout and animating its frustum size right alongside
+// position/rotation during the flight (see startTransition/updateTransition
+// further down).
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 2000);
 camera.position.set(0, -2, 60);
 
 // Antialiasing (MSAA) and a high device pixel ratio are both expensive for
@@ -652,70 +601,163 @@ function updateScreenGlow(){
 }
 
 // ---- Three camera modes ----
-// 'freeroam'      : walk around the room, WASD + mouse look (pointer lock)
-// 'tv'            : the old fixed-axis viewer, locked onto the TV screen
-// 'transitioning' : a short animated hand-off between the two above
+// 'freeroam'      : the default resting view — an orthographic isometric
+//                   view. Click-drag rotates it, but it only ever snaps to
+//                   one of 4 fixed corner angles (90° apart) on release —
+//                   there's no free orbiting. In placement mode (press P),
+//                   WASD/arrows + Space/Shift also pan the view around so you
+//                   can see what you're positioning.
+// 'tv'            : locked onto the TV screen, still orthographic — only
+//                   the frustum size (much smaller/tighter) and position
+//                   differ from the default view.
+// 'transitioning' : a short animated hand-off between the two above, flown
+//                   with the same camera object (see startTransition below).
 let mode = 'freeroam';
 
 const tvControls = new OrbitControls(camera, renderer.domElement);
 tvControls.enableDamping = true;
 tvControls.dampingFactor = 0.08;
-tvControls.minDistance = 10;
-tvControls.maxDistance = 200;
 
-// Only height (vertical position) and zoom (distance) are adjustable.
-// Rotation is fully disabled — drag pans the camera+target straight up/down
-// instead of orbiting, so the TV never spins or tilts. Left/right drift is
-// clamped to zero every frame as a safety net.
+// Only height (vertical position) and zoom are adjustable. Rotation is
+// fully disabled — drag pans the camera+target straight up/down instead of
+// orbiting, so the TV never spins or tilts. Left/right drift is clamped to
+// zero every frame as a safety net. Zoom (not distance) is what "dolly"
+// means for an orthographic camera — OrbitControls scales camera.zoom
+// instead of moving the camera physically closer.
 tvControls.enableRotate = false;
 tvControls.enablePan = true;
 tvControls.screenSpacePanning = true;
 tvControls.panSpeed = 1.2;
+tvControls.minZoom = 0.6;
+tvControls.maxZoom = 3;
 tvControls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
 tvControls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_PAN };
 tvControls.enabled = false;
 
-// The TV camera's height/distance are remembered here across mode switches,
-// so leaving and re-entering the TV view puts the camera right back where
-// you left it, instead of resetting. Also read immediately by the Android
-// TV-lock below, before TV.glb has necessarily finished loading — so these
-// need to already be the real tuned values, not placeholders to overwrite
-// later once the model loads.
+// The TV camera's height/distance/zoom are remembered here across mode
+// switches, so leaving and re-entering the TV view puts the camera right
+// back where you left it, instead of resetting. Also read immediately by
+// the Android TV-lock below, before TV.glb has necessarily finished
+// loading — so these need to already be the real tuned values, not
+// placeholders to overwrite later once the model loads.
 const savedTVCamera = {
   height: 17.5,
   distance: 55,
   targetX: TV_POSITION.x,
-  targetZ: TV_POSITION.z
+  targetZ: TV_POSITION.z,
+  zoom: 1
 };
 
-const freeRoamControls = new PointerLockControls(camera, renderer.domElement);
-const freeRoamStart = new THREE.Vector3(136, 40, 92);
-camera.position.copy(freeRoamStart);
-camera.rotation.set(0, Math.PI / 2, 0); // face west (default forward is north)
+// Half-height of the TV close-up's orthographic frustum at 1x zoom — tune
+// this like the other constants (smaller = tighter framing on the screen).
+const TV_ORTHO_VIEW_SIZE = 23;
 
-// Exact free-roam camera pose (position + facing) at the moment you step up
-// to the TV — restored exactly when you step away again, so your height and
-// facing direction come back correctly instead of resetting to a default.
-const savedFreeRoam = {
-  pos: freeRoamStart.clone(),
-  quat: camera.quaternion.clone()
-};
+// ---- Orthographic frustum sizing ----
+// "View size" (half-height of the frustum) is what controls how much of the
+// world is visible — smaller = more zoomed in. setOrthoFrustum() is the one
+// place that touches camera.left/right/top/bottom, used by every mode;
+// lastRawViewSize caches whatever was passed in last so resize can reapply
+// it at the new aspect ratio without needing to know which mode we're in.
+let lastRawViewSize = 140;
+function setOrthoFrustum(viewSize){
+  lastRawViewSize = viewSize;
+  const aspect = window.innerWidth / window.innerHeight;
+  camera.left = -viewSize * aspect;
+  camera.right = viewSize * aspect;
+  camera.top = viewSize;
+  camera.bottom = -viewSize;
+  camera.updateProjectionMatrix();
+}
+
+// ISO_TARGET/ISO_DISTANCE are guesses, same deal as the other constants in
+// this file: tune them (open devtools, watch the room, adjust, refresh)
+// until the room reads nicely from a corner. ISO_ELEVATION_DEG defaults to
+// the "true isometric" angle (arctan(1/√2) ≈ 35.264°); ISO_ORTHO_VIEW_SIZE_BASE
+// controls zoom — smaller = closer in.
+const ISO_TARGET = TV_POSITION.clone();
+const ISO_DISTANCE = 220;
+const ISO_ELEVATION_DEG = 35.264;
+const ISO_BASE_AZIMUTH_DEG = 45; // the first corner's compass angle
+
+const ISO_ORTHO_VIEW_SIZE_BASE = 140; // half-height of the orthographic frustum at 1x zoom
+const ISO_ZOOM_MIN = 0.35; // most zoomed-in (smallest view size)
+const ISO_ZOOM_MAX = 2.2;  // most zoomed-out (largest view size)
+const ISO_ZOOM_SPEED = 0.0012; // multiplier applied per pixel of wheel delta
+let isoZoom = ISO_ZOOM_MIN;
+
+setOrthoFrustum(ISO_ORTHO_VIEW_SIZE_BASE * isoZoom);
+
+// Mouse-wheel / trackpad zoom for the iso view — works in freeroam whether
+// or not placement mode is on, since zoom is just a closer look, not a
+// change to the room's fixed rotation. Trackpad pinch also arrives as a
+// wheel event with deltaY, so this covers both without extra handling.
+function onIsoWheel(e){
+  if (mode !== 'freeroam') return;
+  e.preventDefault();
+  isoZoom = THREE.MathUtils.clamp(isoZoom * (1 + e.deltaY * ISO_ZOOM_SPEED), ISO_ZOOM_MIN, ISO_ZOOM_MAX);
+  setOrthoFrustum(ISO_ORTHO_VIEW_SIZE_BASE * isoZoom);
+}
+renderer.domElement.addEventListener('wheel', onIsoWheel, { passive: false });
+
+// isoPanOffset shifts ISO_TARGET around in placement mode (WASD/arrows +
+// Space/Shift) — the room itself never moves, just what the camera is
+// centered on.
+const isoPanOffset = new THREE.Vector3(0, 0, 0);
+
+// The single source of truth for "which way is the iso camera currently
+// facing" — a plain compass angle in degrees. It's continuous (not snapped
+// to a corner) while actively dragging or mid-snap-animation; see the drag
+// handlers and updateIsoSnap() further down for how it settles back onto a
+// multiple of 90° from ISO_BASE_AZIMUTH_DEG.
+let isoAzimuthDeg = ISO_BASE_AZIMUTH_DEG;
+
+// Scratch pose — holds where the iso view's camera pose currently computes
+// to, even while TV mode has temporarily taken over the live `camera`. Never
+// added to the scene; just used for its position/quaternion/lookAt math.
+const isoPose = new THREE.Object3D();
+isoPose.isCamera = true; // Object3D.lookAt() faces backwards for plain objects vs cameras — this flag makes it use the camera convention
+
+function applyIsoCameraPose(azimuthDeg, writeToCamera = true){
+  const az = THREE.MathUtils.degToRad(azimuthDeg);
+  const el = THREE.MathUtils.degToRad(ISO_ELEVATION_DEG);
+  const offset = new THREE.Vector3(
+    Math.cos(el) * Math.sin(az),
+    Math.sin(el),
+    Math.cos(el) * Math.cos(az)
+  ).multiplyScalar(ISO_DISTANCE);
+  const target = ISO_TARGET.clone().add(isoPanOffset);
+  isoPose.position.copy(target).add(offset);
+  isoPose.up.set(0, 1, 0);
+  isoPose.lookAt(target);
+  if (writeToCamera){
+    camera.position.copy(isoPose.position);
+    camera.quaternion.copy(isoPose.quaternion);
+  }
+}
+applyIsoCameraPose(isoAzimuthDeg);
 
 const moveState = { forward: false, back: false, left: false, right: false, up: false, down: false };
-const WALK_SPEED = 60; // world units / second
+const WALK_SPEED = 60; // world units / second — used for placement-mode panning
 const clock = new THREE.Clock();
 
 function onKeyDown(e){
   switch (e.code){
+    // These just set flags here; updateFreeRoam() only ever acts on them
+    // while placementMode is on (see below) — otherwise the default view
+    // is a fixed pose and they're inert.
     case 'KeyW': case 'ArrowUp': moveState.forward = true; break;
     case 'KeyS': case 'ArrowDown': moveState.back = true; break;
     case 'KeyA': case 'ArrowLeft': moveState.left = true; break;
     case 'KeyD': case 'ArrowRight': moveState.right = true; break;
-    // Space/Shift just set the flag here; updateFreeRoam() only actually
-    // acts on up/down when placementMode is on, so they're inert otherwise.
     case 'Space': moveState.up = true; break;
     case 'ShiftLeft': case 'ShiftRight': moveState.down = true; break;
     case 'Escape': if (mode === 'tv' && !ANDROID_TV_LOCKED) exitTVMode(); break;
+    case 'KeyC':
+      isoPanOffset.copy(TV_POSITION).sub(ISO_TARGET);
+      isoZoom = ISO_ZOOM_MIN;
+      setOrthoFrustum(ISO_ORTHO_VIEW_SIZE_BASE * isoZoom);
+      applyIsoCameraPose(isoAzimuthDeg);
+      break;
   }
 }
 function onKeyUp(e){
@@ -730,133 +772,6 @@ function onKeyUp(e){
 }
 document.addEventListener('keydown', onKeyDown);
 document.addEventListener('keyup', onKeyUp);
-
-// ---- Mobile / touch controls ----
-// Two independent touch surfaces, mirroring a typical mobile FPS layout:
-//  - a virtual joystick (bottom-left) drives forward/back/strafe, feeding
-//    into the same movement pipeline as WASD via `joyVector`.
-//  - dragging anywhere else on screen looks around, since PointerLockControls
-//    (mouse-lock) doesn't work with touch — we drive the camera quaternion
-//    directly instead.
-const joyVector = { x: 0, y: 0 }; // x: strafe -1..1, y: forward(-1)/back(+1)
-
-(function setupJoystick(){
-  const zone = document.getElementById('joystickZone');
-  const stick = document.getElementById('joystickStick');
-  if (!zone || !stick) return;
-  const maxRadius = 45;
-  let touchId = null, centerX = 0, centerY = 0;
-
-  function start(e){
-    if (touchId !== null) return;
-    const t = e.changedTouches[0];
-    touchId = t.identifier;
-    const rect = zone.getBoundingClientRect();
-    centerX = rect.left + rect.width / 2;
-    centerY = rect.top + rect.height / 2;
-    e.preventDefault();
-  }
-  function move(e){
-    for (const t of e.changedTouches){
-      if (t.identifier !== touchId) continue;
-      let dx = t.clientX - centerX, dy = t.clientY - centerY;
-      const dist = Math.hypot(dx, dy);
-      if (dist > maxRadius){ dx = dx / dist * maxRadius; dy = dy / dist * maxRadius; }
-      stick.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
-      joyVector.x = dx / maxRadius;
-      joyVector.y = dy / maxRadius;
-      e.preventDefault();
-    }
-  }
-  function end(e){
-    for (const t of e.changedTouches){
-      if (t.identifier !== touchId) continue;
-      touchId = null;
-      joyVector.x = 0; joyVector.y = 0;
-      stick.style.transform = 'translate(-50%,-50%)';
-    }
-  }
-  zone.addEventListener('touchstart', start, { passive:false });
-  zone.addEventListener('touchmove', move, { passive:false });
-  zone.addEventListener('touchend', end, { passive:false });
-  zone.addEventListener('touchcancel', end, { passive:false });
-})();
-
-// Touch-look: drag anywhere outside the joystick/UI to rotate the camera,
-// tracked as our own yaw/pitch (same YXZ euler order PointerLockControls
-// uses) rather than relying on pointer lock, which mobile browsers don't
-// support the way desktop does.
-let touchLookId = null, touchLookLastX = 0, touchLookLastY = 0;
-let touchYaw = 0, touchPitch = 0;
-const TOUCH_LOOK_SENSITIVITY = 0.0028;
-
-function syncTouchLookAngles(){
-  const euler = new THREE.Euler(0, 0, 0, 'YXZ');
-  euler.setFromQuaternion(camera.quaternion);
-  touchYaw = euler.y;
-  touchPitch = euler.x;
-}
-
-function onTouchLookStart(e){
-  if (mode !== 'freeroam' || renderer.xr.isPresenting) return;
-  const target = e.target;
-  if (target.closest && target.closest('#joystickZone, #streamPanel')) return;
-  const t = e.changedTouches[0];
-  touchLookId = t.identifier;
-  touchLookLastX = t.clientX;
-  touchLookLastY = t.clientY;
-  syncTouchLookAngles();
-}
-function onTouchLookMove(e){
-  if (touchLookId === null) return;
-  for (const t of e.changedTouches){
-    if (t.identifier !== touchLookId) continue;
-    const dx = t.clientX - touchLookLastX, dy = t.clientY - touchLookLastY;
-    touchLookLastX = t.clientX;
-    touchLookLastY = t.clientY;
-    touchYaw -= dx * TOUCH_LOOK_SENSITIVITY;
-    touchPitch -= dy * TOUCH_LOOK_SENSITIVITY;
-    touchPitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, touchPitch));
-    camera.quaternion.setFromEuler(new THREE.Euler(touchPitch, touchYaw, 0, 'YXZ'));
-    e.preventDefault();
-  }
-}
-function onTouchLookEnd(e){
-  for (const t of e.changedTouches){
-    if (t.identifier === touchLookId) touchLookId = null;
-  }
-}
-document.addEventListener('touchstart', onTouchLookStart, { passive:true });
-document.addEventListener('touchmove', onTouchLookMove, { passive:false });
-document.addEventListener('touchend', onTouchLookEnd, { passive:true });
-document.addEventListener('touchcancel', onTouchLookEnd, { passive:true });
-
-// ---- VR controller thumbstick movement ----
-// While an immersive session is active, poll each controller's gamepad for
-// a thumbstick axis pair and feed it into the same joyVector the on-screen
-// joystick uses, so movement code only has to live in one place.
-function updateXRInput(){
-  const session = renderer.xr.getSession && renderer.xr.getSession();
-  if (!session) return;
-  let ax = 0, ay = 0;
-  for (const source of session.inputSources){
-    const gp = source.gamepad;
-    if (!gp || !gp.axes) continue;
-    // Most XR controllers report the thumbstick as axes[2]/axes[3]
-    // (axes[0]/[1] are often an unused touchpad); fall back if only two axes exist.
-    const [gx, gy] = gp.axes.length >= 4 ? [gp.axes[2], gp.axes[3]] : [gp.axes[0] || 0, gp.axes[1] || 0];
-    if (Math.hypot(gx, gy) > Math.hypot(ax, ay)){ ax = gx; ay = gy; }
-  }
-  if (Math.hypot(ax, ay) > 0.15){
-    joyVector.x = ax;
-    joyVector.y = ay;
-  } else if (!renderer.xr.isPresenting){
-    // no-op; touch joystick owns joyVector when not in XR
-  } else {
-    joyVector.x = 0;
-    joyVector.y = 0;
-  }
-}
 
 // ---- Live placement mode ----
 // Press P (in free-roam) to toggle it, Tab to switch which registered item
@@ -885,7 +800,12 @@ function snapRotationToOctant(radians){
 // Deliberately NOT on WASD/arrows — those already walk the character, so
 // reusing them for placement would move you and the item at the same time.
 function onPlacementKeyDown(e){
-  if (e.code === 'KeyP'){ placementMode = !placementMode; if (placementMode) overscanAdjustMode = false; return; }
+  if (e.code === 'KeyP'){
+    placementMode = !placementMode;
+    if (placementMode) overscanAdjustMode = false;
+    else if (isoDragging) onIsoDragUp(); // don't leave rotation stuck mid-drag
+    return;
+  }
   if (!placementMode) return;
   if (e.code === 'Tab'){
     e.preventDefault();
@@ -951,98 +871,79 @@ function updatePlacement(delta){
   applyPlaceableTransform(item);
 }
 
-// ---- Collision ----
-// Lightweight FPS-style collision against everything in `collidables`
-// (house + TV): horizontal movement gets blocked/slid along walls instead of
-// passing through them, and — outside placement mode — height snaps down
-// onto whatever floor is under the camera instead of letting you fly. It's
-// raycast-based rather than true physics, so it's cheap but not perfect;
-// tune COLLIDER_SKIN / EYE_HEIGHT below if you clip through thin geometry or
-// end up floating/sinking relative to the floor.
-const COLLIDER_SKIN = 6;      // how close to a wall the camera is allowed to get
-const EYE_HEIGHT = 56;        // how high the camera sits above whatever floor it's on
-const FLOOR_SNAP_SPEED = 10;  // how fast height corrects toward the floor each second
-const MAX_STEP_UP = 12;       // floors taller than this above you read as a wall, not a step
-const collisionRay = new THREE.Raycaster();
+// ---- Isometric camera: drag-to-rotate + placement-mode panning ----
+// Click-drag anywhere on the canvas rotates the iso camera live around
+// ISO_TARGET; releasing snaps it to whichever of the 4 fixed corners
+// (90° apart) it ended up closest to — there's no free/arbitrary orbiting.
+// This works in freeroam mode whether or not placement mode is on.
+let isoDragging = false;
+let isoDragStartX = 0;
+let isoDragStartAzimuth = 0;
 
-function tryMove(deltaVec){
-  if (collidables.length === 0 || deltaVec.lengthSq() < 1e-8){
-    camera.position.add(deltaVec);
-    return;
-  }
-  const dist = deltaVec.length();
-  const dir = deltaVec.clone().divideScalar(dist);
-  collisionRay.set(camera.position, dir);
-  collisionRay.far = dist + COLLIDER_SKIN;
-  setCollidableSide(THREE.DoubleSide);
-  const hits = collisionRay.intersectObjects(collidables, true);
-  setCollidableSide(THREE.FrontSide);
-  if (hits.length > 0 && hits[0].distance < dist + COLLIDER_SKIN){
-    // Wall ahead — slide along it instead of just stopping dead.
-    let normal = dir.clone().negate();
-    if (hits[0].face){
-      normal = hits[0].face.normal.clone()
-        .transformDirection(hits[0].object.matrixWorld)
-        .normalize();
-    }
-    const slid = deltaVec.clone().sub(normal.multiplyScalar(deltaVec.dot(normal)));
-    camera.position.add(slid);
-  } else {
-    camera.position.add(deltaVec);
-  }
+// A quick eased hand-off from wherever the drag let go to the snapped-to
+// corner — isoSnapT >= 1 means "not currently snapping".
+let isoSnapFrom = 0, isoSnapTo = 0, isoSnapT = 1;
+const ISO_SNAP_DURATION = 0.35;
+const ISO_DRAG_SENSITIVITY = 0.25; // degrees rotated per pixel dragged
+
+function onIsoDragDown(e){
+  if (mode !== 'freeroam' || !placementMode) return;
+  if (e.target.closest && e.target.closest('#streamPanel')) return;
+  isoDragging = true;
+  isoDragStartX = e.clientX;
+  isoDragStartAzimuth = isoAzimuthDeg;
+  isoSnapT = 1; // cancel any snap animation still finishing from a previous drag
+}
+function onIsoDragMove(e){
+  if (!isoDragging) return;
+  const dx = e.clientX - isoDragStartX;
+  isoAzimuthDeg = isoDragStartAzimuth - dx * ISO_DRAG_SENSITIVITY;
+  applyIsoCameraPose(isoAzimuthDeg);
+}
+function onIsoDragUp(){
+  if (!isoDragging) return;
+  isoDragging = false;
+  const rel = isoAzimuthDeg - ISO_BASE_AZIMUTH_DEG;
+  const nearestCorner = Math.round(rel / 90);
+  isoSnapFrom = isoAzimuthDeg;
+  isoSnapTo = ISO_BASE_AZIMUTH_DEG + nearestCorner * 90;
+  isoSnapT = 0;
+}
+renderer.domElement.addEventListener('pointerdown', onIsoDragDown);
+window.addEventListener('pointermove', onIsoDragMove);
+window.addEventListener('pointerup', onIsoDragUp);
+
+// Called every frame; eases isoAzimuthDeg the rest of the way to the
+// snapped-to corner after a drag release. No-op once settled (isoSnapT >= 1).
+function updateIsoSnap(delta){
+  if (isoSnapT >= 1) return;
+  isoSnapT = Math.min(isoSnapT + delta / ISO_SNAP_DURATION, 1);
+  const eased = isoSnapT * isoSnapT * (3 - 2 * isoSnapT); // smoothstep
+  isoAzimuthDeg = isoSnapFrom + (isoSnapTo - isoSnapFrom) * eased;
+  applyIsoCameraPose(isoAzimuthDeg);
 }
 
-function applyFloorSnap(delta){
-  if (collidables.length === 0) return;
-  collisionRay.set(
-    new THREE.Vector3(camera.position.x, camera.position.y + 40, camera.position.z),
-    new THREE.Vector3(0, -1, 0)
-  );
-  collisionRay.far = 500;
-  setCollidableSide(THREE.DoubleSide);
-  const hits = collisionRay.intersectObjects(collidables, true);
-  setCollidableSide(THREE.FrontSide);
-  if (hits.length === 0) return; // no floor detected under us — leave height alone
-  const targetY = hits[0].point.y + EYE_HEIGHT;
-  const rise = targetY - camera.position.y;
-  // Anything taller than a small step reads as a wall/obstacle, not a floor —
-  // without this, the snap would happily hoist you up and over anything
-  // solid the horizontal collision failed to fully stop, which is exactly
-  // the "climbing over walls" bug this is here to prevent.
-  if (rise > MAX_STEP_UP) return;
-  camera.position.y += rise * Math.min(1, FLOOR_SNAP_SPEED * delta);
-}
-
+// Placement mode also pans the view (WASD/arrows + Space/Shift), shifting
+// isoPanOffset instead of moving the camera directly — direction is relative
+// to whichever way the iso camera currently faces, so "forward" always
+// means "into the screen" regardless of which corner you're looking from.
 function updateFreeRoam(delta){
+  if (!placementMode) return;
   const step = WALK_SPEED * delta;
-  const startPos = camera.position.clone();
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  forward.y = 0;
+  forward.normalize();
+  const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
 
-  updateXRInput();
-
-  // Keyboard gives discrete -1/0/1 input; the joystick/XR thumbstick gives a
-  // continuous -1..1 value. They're simply summed and clamped so either
-  // input source (or both at once) works.
   const kbForward = (moveState.forward ? 1 : 0) - (moveState.back ? 1 : 0);
   const kbRight = (moveState.right ? 1 : 0) - (moveState.left ? 1 : 0);
-  const moveForward = Math.max(-1, Math.min(1, kbForward - joyVector.y));
-  const moveRight = Math.max(-1, Math.min(1, kbRight + joyVector.x));
-
-  if (moveForward !== 0) freeRoamControls.moveForward(moveForward * step);
-  if (moveRight !== 0) freeRoamControls.moveRight(moveRight * step);
-
-  const horizontalDelta = camera.position.clone().sub(startPos);
-  camera.position.copy(startPos);
-  tryMove(horizontalDelta);
-
-  if (placementMode){
-    // Free vertical fly (Space/Shift) is only available while placing items,
-    // so you can move the camera to see what you're positioning. The rest of
-    // the time height is handled by applyFloorSnap() instead.
-    if (moveState.up) camera.position.y += step;
-    if (moveState.down) camera.position.y -= step;
-  } else {
-    applyFloorSnap(delta);
-  }
+  let moved = false;
+  if (kbForward !== 0){ isoPanOffset.addScaledVector(forward, kbForward * step); moved = true; }
+  if (kbRight !== 0){ isoPanOffset.addScaledVector(right, kbRight * step); moved = true; }
+  if (moveState.up){ isoPanOffset.y += step; moved = true; }
+  if (moveState.down){ isoPanOffset.y -= step; moved = true; }
+  if (moved) applyIsoCameraPose(isoAzimuthDeg);
 }
 
 const camHud = document.createElement('div');
@@ -1050,7 +951,6 @@ camHud.id = 'camHud';
 camHud.style.cssText = 'position:absolute;bottom:16px;left:16px;z-index:5;color:#9f9;font-family:monospace;font-size:12px;background:rgba(0,0,0,0.5);padding:6px 10px;border-radius:6px;pointer-events:none;white-space:pre;display:none;';
 document.body.appendChild(camHud);
 
-const crosshairEl = document.getElementById('crosshair');
 const streamPanel = document.getElementById('streamPanel');
 const streamUrlInput = document.getElementById('streamUrlInput');
 const streamStatus = document.getElementById('streamStatus');
@@ -1166,16 +1066,11 @@ if (ANDROID_TV_LOCKED){
   camera.position.set(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ + savedTVCamera.distance);
   tvControls.target.set(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ);
   camera.lookAt(tvControls.target);
+  camera.zoom = savedTVCamera.zoom;
+  setOrthoFrustum(TV_ORTHO_VIEW_SIZE);
   tvControls.enabled = true;
   tvControls.update();
-  crosshairEl.style.display = 'none';
   streamPanel.style.display = 'block';
-  // The on-screen movement joystick is free-roam-only — there's no walking
-  // around to do here, so it'd just sit on screen doing nothing. The CSS
-  // rule that shows it for any touch device (body.touch-device) would
-  // otherwise still apply; this inline style overrides that.
-  const joystickZoneEl = document.getElementById('joystickZone');
-  if (joystickZoneEl) joystickZoneEl.style.display = 'none';
 }
 
 // ---- CRT-fallback mode ----
@@ -1526,8 +1421,8 @@ document.addEventListener('keydown', (e) => {
 const TRANSITION_DURATION = 0.6; // seconds
 let transitionT = 1; // 1 = idle/finished
 let pendingMode = null;
-const transitionFrom = { pos: new THREE.Vector3(), quat: new THREE.Quaternion() };
-const transitionTo = { pos: new THREE.Vector3(), quat: new THREE.Quaternion() };
+const transitionFrom = { pos: new THREE.Vector3(), quat: new THREE.Quaternion(), viewSize: ISO_ORTHO_VIEW_SIZE_BASE };
+const transitionTo = { pos: new THREE.Vector3(), quat: new THREE.Quaternion(), viewSize: ISO_ORTHO_VIEW_SIZE_BASE };
 const lookAtMatrix = new THREE.Matrix4();
 
 function quatLookingAt(fromPos, toPos){
@@ -1535,17 +1430,33 @@ function quatLookingAt(fromPos, toPos){
   return new THREE.Quaternion().setFromRotationMatrix(lookAtMatrix);
 }
 
-function startTransition(toPos, toQuat, finalMode){
+// The frustum's raw bounds ("view size") combine with camera.zoom to give
+// the actual visible extent (roughly viewSize / zoom) — see setOrthoFrustum.
+// This reads off whatever that combined, actually-visible size is right now,
+// for whichever mode is currently live, so a transition can start from
+// exactly what's on screen with no jump.
+function currentEffectiveViewSize(){
+  if (mode === 'tv') return TV_ORTHO_VIEW_SIZE / camera.zoom;
+  return ISO_ORTHO_VIEW_SIZE_BASE * isoZoom;
+}
+
+function startTransition(toPos, toQuat, finalMode, toViewSize){
   transitionFrom.pos.copy(camera.position);
   transitionFrom.quat.copy(camera.quaternion);
+  transitionFrom.viewSize = currentEffectiveViewSize();
+  // Neutralize any TV dolly zoom for the duration of the flight — from here
+  // on, frustum size alone carries the "how zoomed in" information, so it
+  // can be lerped like any other property. Reapplying the just-computed
+  // effective size keeps the framing exactly as it was the instant before.
+  camera.zoom = 1;
+  setOrthoFrustum(transitionFrom.viewSize);
   transitionTo.pos.copy(toPos);
   transitionTo.quat.copy(toQuat);
+  transitionTo.viewSize = toViewSize;
   transitionT = 0;
   pendingMode = finalMode;
   mode = 'transitioning';
   tvControls.enabled = false;
-  if (document.pointerLockElement) freeRoamControls.unlock();
-  crosshairEl.style.display = 'none';
   streamPanel.style.display = 'none';
 }
 
@@ -1554,6 +1465,7 @@ function updateTransition(delta){
   const eased = transitionT * transitionT * (3 - 2 * transitionT); // smoothstep
   camera.position.lerpVectors(transitionFrom.pos, transitionTo.pos, eased);
   camera.quaternion.slerpQuaternions(transitionFrom.quat, transitionTo.quat, eased);
+  setOrthoFrustum(THREE.MathUtils.lerp(transitionFrom.viewSize, transitionTo.viewSize, eased));
   if (transitionT >= 1) finishTransition();
 }
 
@@ -1561,38 +1473,37 @@ function finishTransition(){
   if (pendingMode === 'tv'){
     mode = 'tv';
     tvControls.target.set(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ);
+    // Restore the persisted dolly zoom now that the flight has landed —
+    // combined with the raw TV_ORTHO_VIEW_SIZE bounds this reproduces
+    // exactly the effective size the flight just eased into.
+    camera.zoom = savedTVCamera.zoom;
+    setOrthoFrustum(TV_ORTHO_VIEW_SIZE);
     tvControls.enabled = true;
     tvControls.update();
     streamPanel.style.display = 'block';
   } else {
     mode = 'freeroam';
-    crosshairEl.style.display = '';
+    setOrthoFrustum(ISO_ORTHO_VIEW_SIZE_BASE * isoZoom); // zoom is always 1 here, already true — just re-affirm precisely
   }
   pendingMode = null;
 }
 
 function enterTVMode(){
-  // Remember exactly where — and which way — we were standing, so exiting
-  // later restores this precisely instead of resetting to a fixed height.
-  savedFreeRoam.pos.copy(camera.position);
-  savedFreeRoam.quat.copy(camera.quaternion);
-
   const toPos = new THREE.Vector3(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ + savedTVCamera.distance);
   const toTarget = new THREE.Vector3(savedTVCamera.targetX, savedTVCamera.height, savedTVCamera.targetZ);
   const toQuat = quatLookingAt(toPos, toTarget);
-  startTransition(toPos, toQuat, 'tv');
+  startTransition(toPos, toQuat, 'tv', TV_ORTHO_VIEW_SIZE / savedTVCamera.zoom);
 }
 
 function exitTVMode(){
   tvControls.enabled = false;
-  startTransition(savedFreeRoam.pos, savedFreeRoam.quat, 'freeroam');
-  // Re-lock the pointer right away (still inside this click's user-gesture
-  // window) so mouse-look works the instant you land back in free-roam,
-  // instead of leaving the cursor free and needing a second click.
-  // updateTransition() overwrites camera.quaternion every frame during the
-  // transition anyway, so any look input landing before it finishes is
-  // harmlessly discarded rather than fighting the animation.
-  freeRoamControls.lock();
+  // Head back to wherever the iso view's fixed pose currently is (it never
+  // stopped tracking isoAzimuthDeg/isoPanOffset while we were in TV mode, so
+  // this is exactly the corner/pan the person left). writeToCamera=false
+  // since `camera` is still showing the TV view right up until the flight
+  // starts — this only refreshes the scratch isoPose to read from.
+  applyIsoCameraPose(isoAzimuthDeg, false);
+  startTransition(isoPose.position, isoPose.quaternion, 'freeroam', ISO_ORTHO_VIEW_SIZE_BASE * isoZoom);
 }
 
 function lockAndReportCamera(){
@@ -1604,6 +1515,7 @@ function lockAndReportCamera(){
 
     savedTVCamera.height = camera.position.y;
     savedTVCamera.distance = camera.position.distanceTo(tvControls.target);
+    savedTVCamera.zoom = camera.zoom;
 
     if (placementMode){
       const height = camera.position.y.toFixed(2);
@@ -1823,7 +1735,6 @@ tvLoader.load('TV.glb', (gltf) => {
   tvModel = model;
   scene.add(model);
   registerPlaceable('TV', model, TV_POSITION, TV_ROTATION_Y);
-  makeCollidable(model);
 
   // Hover feedback: a cloned copy of the TV, rendered with the outline
   // shader above, toggled on/off in the mousemove handler below. outlineWidth
@@ -2029,14 +1940,6 @@ const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 let pointerDownAt = 0, pointerDownPos = new THREE.Vector2();
 
-// You have to be reasonably close to the TV to interact with it — stops you
-// from sitting down or surfing channels from across the room.
-const TV_INTERACT_DISTANCE = 120;
-function isWithinTVRange(){
-  if (!tvModel) return false;
-  return camera.position.distanceTo(tvModel.position) <= TV_INTERACT_DISTANCE;
-}
-
 function onPointerDown(e){
   pointerDownAt = performance.now();
   pointerDownPos.set(e.clientX, e.clientY);
@@ -2049,17 +1952,9 @@ function raycastFromClient(x, y, target){
   return raycaster.intersectObject(target, true);
 }
 
-function raycastFromCenter(target){
-  raycaster.setFromCamera({ x: 0, y: 0 }, camera);
-  return raycaster.intersectObject(target, true);
-}
-
-// Hover feedback for the TV outline. When the pointer isn't locked, "hover"
-// means the free mouse cursor is over the TV. Once locked (walking around
-// with mouse-look), there's no free cursor anymore — aiming is done with the
-// center crosshair — so hover instead follows whatever's under that crosshair.
-// Both paths respect TV_INTERACT_DISTANCE, so the outline doubles as a
-// "you're close enough to click this" indicator either way.
+// Hover feedback for the TV outline — the cursor is always free (never
+// pointer-locked), so "hover" is simply whatever's under the free mouse
+// cursor right now.
 let lastMouseX = window.innerWidth / 2, lastMouseY = window.innerHeight / 2;
 renderer.domElement.addEventListener('pointermove', (e) => {
   lastMouseX = e.clientX;
@@ -2072,25 +1967,8 @@ function updateTVHoverOutline(){
     tvOutlineMesh.visible = false;
     return;
   }
-  const hits = document.pointerLockElement
-    ? raycastFromCenter(tvModel)
-    : raycastFromClient(lastMouseX, lastMouseY, tvModel);
-  tvOutlineMesh.visible = hits.length > 0 && isWithinTVRange();
-}
-
-// Same idea for the arcade cabinet — it's just decorative furniture (no
-// click action, no distance gating like the TV's), so hovering it just
-// highlights it, with no range check needed.
-function updateArcadeHoverOutline(){
-  if (!arcadeModel || !arcadeOutlineMesh) return;
-  if (mode !== 'freeroam'){
-    arcadeOutlineMesh.visible = false;
-    return;
-  }
-  const hits = document.pointerLockElement
-    ? raycastFromCenter(arcadeModel)
-    : raycastFromClient(lastMouseX, lastMouseY, arcadeModel);
-  arcadeOutlineMesh.visible = hits.length > 0;
+  const hits = raycastFromClient(lastMouseX, lastMouseY, tvModel);
+  tvOutlineMesh.visible = hits.length > 0;
 }
 
 function onPointerUp(e){
@@ -2112,27 +1990,16 @@ function onPointerUp(e){
     return;
   }
 
-  // mode === 'freeroam'
-  if (document.pointerLockElement){
-    // Already looking around — click uses the center crosshair.
-    const tvHits = raycastFromCenter(tvModel);
-    if (tvHits.length > 0 && isWithinTVRange()) enterTVMode();
-  } else {
-    // First click: check the TV under the cursor before grabbing the pointer.
-    const tvHits = raycastFromClient(e.clientX, e.clientY, tvModel);
-    if (tvHits.length > 0 && isWithinTVRange()){
-      enterTVMode();
-    } else {
-      freeRoamControls.lock();
-    }
-  }
+  // mode === 'freeroam': click the TV to zoom in; click anywhere else does
+  // nothing now that there's no more walking to trigger.
+  const tvHits = raycastFromClient(e.clientX, e.clientY, tvModel);
+  if (tvHits.length > 0) enterTVMode();
 }
 renderer.domElement.addEventListener('pointerdown', onPointerDown);
 renderer.domElement.addEventListener('pointerup', onPointerUp);
 
 window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
+  setOrthoFrustum(lastRawViewSize);
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
@@ -2153,12 +2020,6 @@ function animate() {
     tvOutlineMesh.scale.copy(tvModel.scale);
   }
   updateTVHoverOutline();
-  if (arcadeOutlineMesh && arcadeModel){
-    arcadeOutlineMesh.position.copy(arcadeModel.position);
-    arcadeOutlineMesh.rotation.copy(arcadeModel.rotation);
-    arcadeOutlineMesh.scale.copy(arcadeModel.scale);
-  }
-  updateArcadeHoverOutline();
 
   if (mode === 'tv'){
     tvControls.update();
