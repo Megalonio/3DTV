@@ -1067,10 +1067,21 @@ function looksLikeM3U(url){
 
 // A real HLS playlist is also #EXTM3U, but carries HLS-specific tags
 // (#EXT-X-STREAM-INF / #EXT-X-TARGETDURATION); a channel list has neither.
+//
+// Deliberately searches for a "#EXTM3U" line anywhere in the text rather
+// than requiring it at the very start — paste sites routinely wrap the
+// actual pasted content with their own banners, donation prompts, or
+// footers (rentry.co does this in the page body itself, not just in
+// <head>), and anchoring strictly to the start would fail the moment any
+// such wrapper text precedes the real content. Everything before that line
+// is ignored; everything after is safe too, since the per-line loop below
+// only acts on "#EXTINF" lines and skips/ignores anything else it finds.
 function parseChannelList(text){
-  if (!/^\s*#EXTM3U/.test(text)) return null;
-  if (/#EXT-X-STREAM-INF|#EXT-X-TARGETDURATION/.test(text)) return null;
-  const lines = text.split(/\r?\n/);
+  const start = text.search(/^[ \t]*#EXTM3U\b/m);
+  if (start === -1) return null;
+  const body = text.slice(start);
+  if (/#EXT-X-STREAM-INF|#EXT-X-TARGETDURATION/.test(body)) return null;
+  const lines = body.split(/\r?\n/);
   const channels = [];
   for (let i = 0; i < lines.length; i++){
     const line = lines[i].trim();
@@ -1082,6 +1093,144 @@ function parseChannelList(text){
     if (url) channels.push({ name: name || ('Channel ' + (channels.length + 1)), url });
   }
   return channels.length > 1 ? channels : null;
+}
+
+// Common direct-media extensions — these skip the channel-list check
+// entirely, since there's no reason to probe an obvious video file.
+// Anything else (including a paste-site link like rentry.co with no
+// extension at all) gets peeked at, since a channel list isn't reliably
+// identifiable by URL shape alone.
+function looksLikeDirectMediaFile(url){
+  return /\.(mp4|m4v|mkv|webm|mov|avi|flv|ts|ogg|ogv)(\?|#|$)/i.test(url);
+}
+
+// Checks whether a URL's response is (or contains) a channel list. Skips
+// reading the body at all for an obviously-media Content-Type. Otherwise
+// reads the full text — cheap here since we've already filtered out known
+// video extensions before calling this, so what's left is pages/playlists,
+// not large binaries.
+async function peekChannelListFrom(candidateUrl){
+  const res = await fetch(candidateUrl);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`); // treat as a failed attempt, same as a network error
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (/^(video|audio)\//.test(contentType)) return null; // definitely media — don't bother reading it
+
+  const text = await res.text();
+  if (/^\s*#EXTM3U/.test(text)) return parseChannelList(text);
+
+  // Paste sites (rentry.co included) often show the pasted content inside
+  // the normal rendered page rather than a fetchable raw endpoint. A code
+  // block is usually how a literal "#EXTM3U" line survives there at all —
+  // plain Markdown would otherwise read a leading "#" as a heading and
+  // strip it. Dig into <pre>/<code>/<textarea> before giving up.
+  if (/<html[\s>]/i.test(text)){
+    const extracted = extractChannelListFromHtml(text);
+    if (extracted) return extracted;
+  }
+
+  console.warn('Fetched link, but couldn\'t find a channel list in it. First bytes:', JSON.stringify(text.slice(0, 80)));
+  return null;
+}
+
+// Looks for a channel list embedded inside a rendered HTML page — e.g. a
+// paste site (rentry.co included) that shows the pasted text on its normal
+// page rather than via a fetchable raw endpoint.
+function decodeHtmlEntities(text){
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&'); // must be last, or "&amp;lt;" etc. double-decode
+}
+
+// Turns a chunk of HTML into plain text while converting <br> and
+// block-level tag boundaries into real newlines first — a paste site often
+// renders single line breaks as <br> rather than a literal newline
+// character, and losing that would merge an #EXTINF line and its URL line
+// together, breaking parseChannelList's line-based parsing.
+//
+// rentry.co (and similar Markdown paste sites) go a step further: a line
+// starting with "#" — exactly what "#EXTM3U"/"#EXTINF" lines look like — is
+// itself valid ATX heading syntax, so it gets rendered as an <h1>..<h6> and
+// the leading "#" character(s) are *consumed* by the heading markup rather
+// than kept in the visible text. Losing that "#" is fatal here, since it's
+// the very character parseChannelList looks for. So headings get their "#"
+// prefix reconstructed (one "#" per heading level) before tags are stripped.
+// Headers also often carry a permalink anchor next to the heading text (a
+// "¶" link) — that's stripped first so it doesn't get tacked onto the end
+// of the restored line.
+function htmlToLines(html){
+  const withoutPermalinks = html.replace(
+    /<a\b[^>]*class="[^"]*headerlink[^"]*"[^>]*>[\s\S]*?<\/a>/gi,
+    ''
+  );
+  const withRestoredHashes = withoutPermalinks.replace(
+    /<h([1-6])(?:\s[^>]*)?>/gi,
+    (_m, level) => '\n' + '#'.repeat(Number(level))
+  );
+  const withBreaks = withRestoredHashes
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|h[1-6])>/gi, '\n');
+  return decodeHtmlEntities(withBreaks.replace(/<[^>]+>/g, ''));
+}
+
+// Drops parts of the page that never hold real content but can still leak
+// text once tags are stripped: <script>/<style> bodies (e.g. analytics
+// snippets like a stray "gtag(...)" call), and everything in <head> — a
+// page's <title> in particular can echo a fragment of the pasted content
+// (rentry titles a page after its first line) and, sitting before the real
+// <body>, would otherwise end up *first* in the reconstructed text — which
+// is fatal, since parseChannelList only checks that the text *starts with*
+// "#EXTM3U".
+function stripNonContent(html){
+  const withoutScripts = html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '');
+  const bodyMatch = withoutScripts.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+  return bodyMatch ? bodyMatch[1] : withoutScripts;
+}
+
+function extractChannelListFromHtml(html){
+  const bodyHtml = stripNonContent(html);
+
+  // <pre>/<code> blocks preserve the source's literal formatting (real
+  // newlines), so they're the most reliable candidate when present.
+  const blockRegex = /<(?:pre|code)[^>]*>([\s\S]*?)<\/(?:pre|code)>/gi;
+  let match;
+  while ((match = blockRegex.exec(bodyHtml))){
+    const candidate = decodeHtmlEntities(match[1]).trim();
+    const parsed = parseChannelList(candidate);
+    console.log('Checked a <pre>/<code> block for a channel list:', candidate.slice(0, 200), parsed ? `→ matched ${parsed.length} channels` : '→ no match');
+    if (parsed) return parsed;
+  }
+  // Otherwise, reconstruct line breaks across the page body and try that.
+  const candidate = htmlToLines(bodyHtml).trim();
+  const parsed = parseChannelList(candidate);
+  console.log('Reconstructed page text for a channel list:', candidate.slice(0, 400), parsed ? `→ matched ${parsed.length} channels` : '→ no match');
+  return parsed;
+}
+
+// Most paste sites (rentry.co included) don't set CORS headers for direct
+// fetch from a browser, so — same as media playback below — try straight
+// first, then each CORS proxy in turn. Logs each failed attempt, since a
+// silent fall-through here used to be indistinguishable from "not a list".
+async function peekChannelList(url){
+  try {
+    return await peekChannelListFrom(url);
+  } catch (err){
+    console.warn('Direct fetch for channel-list check failed; trying CORS proxies next:', err);
+  }
+  for (const prefix of CORS_PROXIES){
+    try {
+      return await peekChannelListFrom(proxied(prefix, url));
+    } catch (err){
+      console.warn(`CORS proxy (${prefix}) failed for channel-list check too:`, err);
+    }
+  }
+  console.warn('All CORS proxies failed the channel-list check too; treating link as direct media instead.');
+  return null;
 }
 
 // ---- Proxying an entire HLS stream, not just its first request ----
@@ -1205,30 +1354,45 @@ function proxied(prefix, url){
   return prefix + encodeURIComponent(url);
 }
 
-async function playMediaUrl(url){
+// Bumped by every top-level load (loadStreamUrl / tuneToChannel) so that a
+// newer request (e.g. rapid channel taps) can tell an older, still-in-flight
+// one to stop. Without this, an old attempt kept working through every CORS
+// proxy in turn — each of its vid.pause()/vid.load() calls aborting the
+// *next* attempt's pending play(), which is what surfaced as a cascade of
+// "play() request was interrupted by a call to pause()" AbortErrors.
+let currentLoadToken = 0;
+
+async function playMediaUrl(url, token){
   vid.setAttribute('crossorigin', 'anonymous');
 
   try {
     await loadIntoVideoElement(url, '');
+    if (token !== currentLoadToken) return; // a newer request took over mid-flight
     setCrtFallback(false);
     return;
   } catch (err){
+    if (token !== currentLoadToken) return;
     console.warn('Direct playback with CORS requested failed; trying CORS proxies next:', err);
   }
 
   for (const prefix of CORS_PROXIES){
+    if (token !== currentLoadToken) return;
     try {
       await loadIntoVideoElement(url, prefix);
+      if (token !== currentLoadToken) return;
       setCrtFallback(false);
       return;
     } catch (err){
+      if (token !== currentLoadToken) return;
       console.warn(`CORS proxy (${prefix}) failed too, trying the next one:`, err);
     }
   }
 
+  if (token !== currentLoadToken) return;
   console.warn('All CORS proxies failed; falling back to direct playback without CORS (skips the CRT effect for this source).');
   vid.removeAttribute('crossorigin');
   await loadIntoVideoElement(url, ''); // last resort — let this one throw normally if it also fails
+  if (token !== currentLoadToken) return;
   setCrtFallback(true);
 }
 
@@ -1236,11 +1400,14 @@ async function tuneToChannel(index){
   if (!channelList || !channelList[index]) return;
   channelIndex = index;
   const ch = channelList[index];
+  const myToken = ++currentLoadToken;
   streamStatus.textContent = 'Loading ' + ch.name + '…';
   try {
-    await playMediaUrl(ch.url);
+    await playMediaUrl(ch.url, myToken);
+    if (myToken !== currentLoadToken) return; // superseded by a newer request
     streamStatus.textContent = 'Playing: ' + ch.name + (crtFallbackActive ? ' (no CRT effect — source doesn\'t support it)' : '');
   } catch (err){
+    if (myToken !== currentLoadToken) return;
     console.error('Failed to tune channel:', ch.name, err);
     streamStatus.textContent = 'Couldn\'t load "' + ch.name + '"';
   }
@@ -1259,32 +1426,36 @@ async function loadStreamUrl(url){
   url = url.trim();
   if (!url) return;
   rememberRecentSource(url);
+  const myToken = ++currentLoadToken;
   streamStatus.textContent = 'Loading…';
   flashStatic(350);
   channelList = null;
 
-  // If this looks like an m3u/m3u8 link, fetch it to check if it's a
-  // multi-channel list vs a single stream. Falls through to playMediaUrl()
-  // on fetch failure (e.g. CORS).
-  if (looksLikeM3U(url)){
+  // A channel list isn't reliably identifiable by URL shape (a rentry/paste
+  // link has no .m3u8 in it at all), so anything that isn't an obvious
+  // direct media file gets peeked at for the #EXTM3U signature first. Falls
+  // through to playMediaUrl() if it's not a list (or the peek fails, e.g. CORS).
+  if (!looksLikeDirectMediaFile(url)){
     try {
-      const res = await fetch(url);
-      const text = await res.text();
-      const parsed = parseChannelList(text);
+      const parsed = await peekChannelList(url);
+      if (myToken !== currentLoadToken) return; // superseded while checking the link
       if (parsed){
         channelList = parsed;
         await tuneToChannel(0);
         return;
       }
     } catch (err){
-      console.warn('Could not fetch playlist to check for a channel list (likely CORS) — trying direct playback:', err);
+      if (myToken !== currentLoadToken) return;
+      console.warn('Could not check link for a channel list (likely CORS) — trying direct playback:', err);
     }
   }
 
   try {
-    await playMediaUrl(url);
+    await playMediaUrl(url, myToken);
+    if (myToken !== currentLoadToken) return;
     streamStatus.textContent = 'Playing' + (crtFallbackActive ? ' (no CRT effect — source doesn\'t support it)' : '');
   } catch (err){
+    if (myToken !== currentLoadToken) return;
     console.error('Failed to load stream:', err);
     streamStatus.textContent = 'Couldn\'t load that link';
   }
