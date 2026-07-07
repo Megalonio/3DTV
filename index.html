@@ -544,9 +544,12 @@ const tvControls = new OrbitControls(camera, renderer.domElement);
 tvControls.enableDamping = true;
 tvControls.dampingFactor = 0.08;
 
-// Only height + zoom adjustable; rotation disabled so the TV never spins/tilts.
+// Rotation disabled so the TV never spins/tilts. Pan (which is what moves
+// the camera height/target here) is gated behind placement mode — regular
+// users only get zoom; height adjustment is a placement-mode-only privilege,
+// synced each frame in animate() via tvControls.enablePan = placementMode.
 tvControls.enableRotate = false;
-tvControls.enablePan = true;
+tvControls.enablePan = false;
 tvControls.screenSpacePanning = true;
 tvControls.panSpeed = 1.2;
 tvControls.minZoom = 0.6;
@@ -1622,6 +1625,7 @@ function animate() {
   updateTVHoverOutline();
 
   if (mode === 'tv'){
+    tvControls.enablePan = placementMode;
     tvControls.update();
   } else if (mode === 'freeroam'){
     updateFreeRoam(delta);
